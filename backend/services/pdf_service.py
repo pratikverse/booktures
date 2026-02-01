@@ -1,21 +1,22 @@
-# responsible for saving pdf files to storage/pdfs (both locally and on server)
+# responsible for saving pdf files to storage/pdfs (both locally and from urls)
 # extract text page-by-page
 
 import os
-
-#uuid generates unique identifiers for each pdf 
+#uuid generates unique identifiers for each pdf as some pdfs may have same names
 import uuid
-
 import pdfplumber
 
+#padth were the pdf files will be stored
 PDF_STORAGE_PATH = "storage/pdfs"
 
 def save_pdf(file_bytes: bytes, filename: str) -> str:
     os.makedirs(PDF_STORAGE_PATH, exist_ok=True)
 
+    #generates random id for any pdf to avoid name collisions
     unique_name = f"{uuid.uuid4()}_{filename}"
     file_path = os.path.join(PDF_STORAGE_PATH, unique_name)
 
+    #writes binary data of file to the path
     with open(file_path, "wb") as f:
         f.write(file_bytes)
 
