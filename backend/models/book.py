@@ -14,6 +14,6 @@ class Book(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
-    # Relationship to characters
-    characters = relationship("Character", back_populates="book")
+    # Relationships
     pages = relationship("Page", back_populates="book", cascade="all, delete-orphan")
+    characters = relationship("Character", back_populates="book", cascade="all, delete-orphan")

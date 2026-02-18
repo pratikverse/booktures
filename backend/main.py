@@ -4,11 +4,16 @@ import logging
 from database import engine, Base, SessionLocal
 from api.routes import router
 
+# Import all models so they're registered with Base
+from models.book import Book
+from models.page import Page
+from models.character import Character
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create tables on startup
+# Create tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
@@ -20,7 +25,7 @@ app = FastAPI(
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change to specific domains in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,7 +36,6 @@ app.include_router(router)
 
 @app.get("/", tags=["Health"])
 def health_check():
-    """Check if the API is running"""
     return {
         "status": "Booktures backend running",
         "version": "1.0.0"
@@ -39,7 +43,6 @@ def health_check():
 
 @app.get("/health/db", tags=["Health"])
 def db_health_check():
-    """Check database connectivity"""
     try:
         db = SessionLocal()
         db.execute("SELECT 1")

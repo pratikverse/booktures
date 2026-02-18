@@ -12,8 +12,8 @@ class Character(Base):
     description = Column(Text, nullable=True)
     
     # Visual data
-    visual_profile = Column(JSON, nullable=True)  # Store structured visual data
-    reference_image = Column(String(500), nullable=True)  # File path or URL
+    visual_profile = Column(JSON, nullable=True)
+    reference_image = Column(String(500), nullable=True)
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
