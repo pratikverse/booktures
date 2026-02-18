@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Conda
+*.conda
+*.env
+env/
+venv/
+
+# FastAPI
+storage/
+*.sqlite3
+
+# ML / Images
+*.png
+*.jpg
+*.jpeg
+
+# PDFs
+*.pdf
+
+# Node
+node_modules/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Conda
+*.conda
+*.env
+env/
+venv/
+
+# FastAPI
+storage/
+*.sqlite3
+
+# ML / Images
+*.png
+*.jpg
+*.jpeg
+
+# PDFs
+*.pdf
+
+# Node
+node_modules/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+booktures.db
