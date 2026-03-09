@@ -1,10 +1,14 @@
-from sqlalchemy import Column, Integer, String, JSON
+from sqlalchemy import Column, Integer, String, ForeignKey
 from database import Base
+
 
 class Character(Base):
     __tablename__ = "characters"
 
     id = Column(Integer, primary_key=True, index=True)
+    book_id = Column(Integer, ForeignKey("books.id"), index=True)
     name = Column(String, index=True)
-    visual_profile = Column(JSON)
-    reference_image = Column(String)
+    source = Column(String, default="ner")  # e.g., "ner", "web", or "ner+web"
+    mention_count = Column(Integer, default=0)
+    first_appearance_page = Column(Integer, nullable=True)
+    external_url = Column(String, nullable=True)
