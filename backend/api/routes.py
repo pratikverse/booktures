@@ -7,12 +7,29 @@ from pydantic import BaseModel
 from database import SessionLocal
 from models.book import Book
 from models.page import Page
+from models.page_asset import PageAsset
 from services.pdf_service import save_pdf, extract_text_by_page
-from services.character_service import build_character_registry
-from services.prompt_service import build_page_visual_prompt
+from services.generation_queue_service import (
+    enqueue_book_pipeline,
+    enqueue_page_image,
+    get_job,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _page_exists(book_id: int, page_number: int) -> bool:
+    db = SessionLocal()
+    try:
+        return (
+            db.query(Page.id)
+            .filter(Page.book_id == book_id, Page.page_number == page_number)
+            .first()
+            is not None
+        )
+    finally:
+        db.close()
 
 
 def create_book_placeholder(filename: str, source: str) -> Book:
@@ -57,11 +74,11 @@ def finalize_book_pages(book_id: int, pdf_path: str):
     finally:
         db.close()
 
-    logger.info("Scheduling character registry for book %s", book_id)
+    logger.info("Queueing book pipeline for book %s", book_id)
     try:
-        build_character_registry(book_id)
+        enqueue_book_pipeline(book_id)
     except Exception:
-        logger.exception("Character enrichment failed for book %s", book_id)
+        logger.exception("Book pipeline enqueue failed for book %s", book_id)
 
 
 @router.get("/health")
@@ -94,6 +111,12 @@ async def upload_pdf(
 
 class PDFUrlRequest(BaseModel):
     url: str
+
+
+class PageImageRequest(BaseModel):
+    style_preset: str = "storybook"
+    force_prompt_refresh: bool = False
+    force_regenerate: bool = False
 
 
 @router.post("/import-pdf")
@@ -138,8 +161,22 @@ def import_pdf_from_url(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/books/{book_id}/pages/{page_number}")
-def get_page(book_id: int, page_number: int):
+@router.post("/books/{book_id}/pages/{page_number}/generate-image")
+def queue_page_image(book_id: int, page_number: int, body: PageImageRequest):
+    if not _page_exists(book_id, page_number):
+        raise HTTPException(status_code=404, detail="Page not found")
+    job_id = enqueue_page_image(
+        book_id=book_id,
+        page_number=page_number,
+        style_preset=body.style_preset,
+        force_prompt_refresh=body.force_prompt_refresh,
+        force_regenerate=body.force_regenerate,
+    )
+    return {"status": "queued", "job_id": job_id, "book_id": book_id, "page_number": page_number}
+
+
+@router.get("/books/{book_id}/pages/{page_number}/asset")
+def get_page_asset(book_id: int, page_number: int):
     db = SessionLocal()
     try:
         page = (
@@ -147,23 +184,41 @@ def get_page(book_id: int, page_number: int):
             .filter(Page.book_id == book_id, Page.page_number == page_number)
             .first()
         )
-
-        if not page:
+        if page is None:
             raise HTTPException(status_code=404, detail="Page not found")
-
+        asset = db.query(PageAsset).filter(PageAsset.page_id == page.id).one_or_none()
+        if asset is None:
+            return {
+                "book_id": book_id,
+                "page_number": page_number,
+                "status": "missing",
+                "scene_summary": None,
+                "visual_prompt": None,
+                "negative_prompt": None,
+                "style_preset": None,
+                "image_path": None,
+                "image_status": "pending",
+                "last_error": None,
+            }
         return {
             "book_id": book_id,
-            "page_number": page.page_number,
-            "text": page.text
+            "page_number": page_number,
+            "status": "ok",
+            "scene_summary": asset.scene_summary,
+            "visual_prompt": asset.visual_prompt,
+            "negative_prompt": asset.negative_prompt,
+            "style_preset": asset.style_preset,
+            "image_path": asset.image_path,
+            "image_status": asset.image_status,
+            "last_error": asset.last_error,
         }
-
     finally:
         db.close()
 
 
-@router.get("/books/{book_id}/pages/{page_number}/visual-prompt")
-def get_page_visual_prompt(book_id: int, page_number: int):
-    data = build_page_visual_prompt(book_id, page_number)
-    if data["status"] == "not_found":
-        raise HTTPException(status_code=404, detail="Page not found")
+@router.get("/jobs/{job_id}")
+def get_generation_job(job_id: int):
+    data = get_job(job_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     return data

@@ -2,12 +2,14 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 
 import requests
 
 from database import SessionLocal
 from models.character import Character
 from models.page import Page
+from models.page_asset import PageAsset
 from models.page_character import PageCharacter
 from services.character_service import resolve_page_characters
 
@@ -15,14 +17,36 @@ logger = logging.getLogger(__name__)
 
 MAX_SCENE_CHARS = 420
 MAX_PROMPT_CHARS = 700
+MAX_PROMPT_WORDS = 130
 MAX_CHARACTERS_PER_PAGE = 4
 SUMMARY_CONTEXT_LIMIT = 2400
 OLLAMA_URL = os.getenv("BOOKTURES_OLLAMA_URL", "http://127.0.0.1:11434/v1/chat/completions")
 OLLAMA_MODEL = os.getenv("BOOKTURES_OLLAMA_MODEL", "qwen2.5:3b-instruct")
 OLLAMA_TIMEOUT = int(os.getenv("BOOKTURES_OLLAMA_TIMEOUT", "35"))
+DEFAULT_STYLE_PRESET = "storybook"
+
+STYLE_PRESETS = {
+    "storybook": {
+        "style": "illustrated storybook style, cinematic composition, coherent character continuity",
+        "negative": "blurry, distorted face, extra limbs, low detail, text watermark, logo",
+    },
+    "comic": {
+        "style": "graphic novel comic style, bold linework, dramatic lighting, coherent character continuity",
+        "negative": "photo-realistic skin, blur, extra fingers, watermark, gibberish text",
+    },
+    "cinematic": {
+        "style": "cinematic digital painting, volumetric light, rich atmosphere, coherent character continuity",
+        "negative": "flat lighting, low contrast, blur, deformed anatomy, watermark",
+    },
+}
 
 
-def build_page_visual_prompt(book_id: int, page_number: int) -> dict:
+def build_page_visual_prompt(
+    book_id: int,
+    page_number: int,
+    style_preset: str = DEFAULT_STYLE_PRESET,
+    force_refresh: bool = False,
+) -> dict:
     db = SessionLocal()
     try:
         page = (
@@ -39,9 +63,42 @@ def build_page_visual_prompt(book_id: int, page_number: int) -> dict:
                 "characters": [],
             }
 
+        asset = _get_or_create_asset(db, book_id, page)
+        resolved_style = _resolve_style_preset(style_preset)
+        if (
+            not force_refresh
+            and asset.visual_prompt
+            and asset.scene_summary
+            and asset.style_preset == resolved_style
+        ):
+            return {
+                "book_id": book_id,
+                "page_number": page_number,
+                "status": "ok",
+                "scene_summary": asset.scene_summary,
+                "visual_prompt": asset.visual_prompt,
+                "negative_prompt": asset.negative_prompt or "",
+                "style_preset": asset.style_preset,
+                "characters": _load_page_characters(db, book_id, page),
+                "cached": True,
+            }
+
         characters = _load_page_characters(db, book_id, page)
         scene_summary = _build_scene_summary(page.text or "")
-        visual_prompt = _compose_visual_prompt(scene_summary, characters)
+        visual_prompt, negative_prompt = _compose_visual_prompt(
+            scene_summary,
+            characters,
+            resolved_style,
+        )
+
+        asset.scene_summary = scene_summary
+        asset.visual_prompt = visual_prompt
+        asset.negative_prompt = negative_prompt
+        asset.style_preset = resolved_style
+        asset.prompt_generated_at = datetime.utcnow()
+        asset.updated_at = datetime.utcnow()
+        db.add(asset)
+        db.commit()
 
         return {
             "book_id": book_id,
@@ -49,10 +106,36 @@ def build_page_visual_prompt(book_id: int, page_number: int) -> dict:
             "status": "ok",
             "scene_summary": scene_summary,
             "visual_prompt": visual_prompt,
+            "negative_prompt": negative_prompt,
+            "style_preset": resolved_style,
             "characters": characters,
+            "cached": False,
         }
     finally:
         db.close()
+
+
+def _resolve_style_preset(style_preset: str) -> str:
+    candidate = (style_preset or DEFAULT_STYLE_PRESET).strip().lower()
+    if candidate not in STYLE_PRESETS:
+        return DEFAULT_STYLE_PRESET
+    return candidate
+
+
+def _get_or_create_asset(db, book_id: int, page: Page) -> PageAsset:
+    asset = db.query(PageAsset).filter(PageAsset.page_id == page.id).one_or_none()
+    if asset is not None:
+        return asset
+    asset = PageAsset(
+        book_id=book_id,
+        page_id=page.id,
+        page_number=page.page_number,
+        style_preset=DEFAULT_STYLE_PRESET,
+        image_status="pending",
+    )
+    db.add(asset)
+    db.flush()
+    return asset
 
 
 def _load_page_characters(db, book_id: int, page: Page) -> list[dict]:
@@ -184,9 +267,14 @@ def _limit_to_single_sentence(text: str) -> str:
     return chunks[0].strip() if chunks else text.strip()
 
 
-def _compose_visual_prompt(scene_summary: str, characters: list[dict]) -> str:
+def _compose_visual_prompt(
+    scene_summary: str,
+    characters: list[dict],
+    style_preset: str,
+) -> tuple[str, str]:
+    preset = STYLE_PRESETS.get(style_preset, STYLE_PRESETS[DEFAULT_STYLE_PRESET])
     pieces = [
-        "illustrated storybook style, cinematic composition, coherent character continuity",
+        preset["style"],
     ]
     if scene_summary:
         pieces.append(f"scene: {scene_summary}")
@@ -206,5 +294,14 @@ def _compose_visual_prompt(scene_summary: str, characters: list[dict]) -> str:
     else:
         pieces.append("focus on environment, mood, and narrative action")
 
-    prompt = ". ".join(piece for piece in pieces if piece)
-    return prompt[:MAX_PROMPT_CHARS]
+    prompt = ". ".join(piece for piece in pieces if piece).strip()
+    prompt = _guard_prompt(prompt)
+    return prompt[:MAX_PROMPT_CHARS], preset["negative"]
+
+
+def _guard_prompt(prompt: str) -> str:
+    trimmed = prompt[:MAX_PROMPT_CHARS]
+    words = trimmed.split()
+    if len(words) <= MAX_PROMPT_WORDS:
+        return trimmed
+    return " ".join(words[:MAX_PROMPT_WORDS])

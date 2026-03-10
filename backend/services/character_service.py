@@ -289,7 +289,7 @@ def _earliest_page(a: Optional[int], b: Optional[int]) -> Optional[int]:
 
 
 def _normalize_name(name: str) -> str:
-    name = re.sub(r"[’']s\b", "", name)
+    name = re.sub(r"'s\b", "", name)
     cleaned = re.sub(r"[^\w\s\-']", "", name)
     cleaned = re.sub(r"\s+", " ", cleaned)
     stripped = _strip_titles(cleaned).strip()
