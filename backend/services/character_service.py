@@ -1,19 +1,17 @@
+import json
 import logging
 import re
-from typing import Iterable, Optional
-from urllib.parse import quote
-
-import json
-import requests
-import spacy
-from bs4 import BeautifulSoup
-from rapidfuzz import fuzz
 from collections import Counter
+from typing import Iterable, Optional
+
+import spacy
+from rapidfuzz import fuzz
 
 from database import SessionLocal
 from models.book import Book
 from models.character import Character
 from models.page import Page
+from models.page_character import PageCharacter
 
 logger = logging.getLogger(__name__)
 try:
@@ -22,17 +20,35 @@ except Exception:  # pragma: no cover
     logger.info("Falling back to en_core_web_sm")
     _nlp = spacy.load("en_core_web_sm")
 
-MATCH_THRESHOLD = 70
-MIN_NER_MENTIONS = 2
-MIN_TOTAL_MENTIONS = 3
-CANONICAL_SOURCES = {"web", "web-search", "ner+web"}
-ALIAS_MATCH_SCORE = 85
-IGNORE_TOKENS = {"mr", "mrs", "ms", "sir", "lady", "lord", "god", "man"}
+ALIAS_MATCH_SCORE = 88
+PAGE_LINK_MATCH_SCORE = 90
+MIN_TOTAL_MENTIONS = 2
+MIN_PAGE_CONFIDENCE = 0.45
 TITLE_TOKENS = {"mr", "mrs", "miss", "ms", "sir", "lady", "lord", "dr"}
-DDG_SEARCH_URL = "https://duckduckgo.com/html/"
-SEARCH_RESULT_LIMIT = 3
-NAME_PATTERN = re.compile(r"[A-Z][a-z]+(?:[''\-][A-Z][a-z]+)*(?:\s+[A-Z][a-z]+(?:[''\-][A-Z][a-z]+)*)+")
-SEARCH_HEADERS = {"User-Agent": "Booktures Character Extractor/1.0"}
+IGNORE_TOKENS = {"man", "woman", "boy", "girl", "father", "mother", "uncle", "aunt"}
+STOP_DESCRIPTOR_WORDS = {
+    "very",
+    "quite",
+    "rather",
+    "more",
+    "most",
+    "little",
+    "much",
+    "the",
+    "a",
+    "an",
+}
+VISUAL_PATTERN = re.compile(
+    r"\b(tall|short|slender|stocky|thin|broad|old|young|elderly|bearded|clean-shaven|"
+    r"blonde|fair-haired|dark-haired|black-haired|red-haired|blue-eyed|green-eyed|"
+    r"scarred|pale|freckled|handsome|beautiful|elegant|ragged|shabby)\b",
+    re.IGNORECASE,
+)
+VISUAL_CONFLICT_GROUPS = [
+    {"young", "old", "elderly"},
+    {"bearded", "clean-shaven"},
+    {"blonde", "dark-haired", "black-haired", "red-haired", "fair-haired"},
+]
 
 
 def build_character_registry(book_id: int):
@@ -50,25 +66,56 @@ def build_character_registry(book_id: int):
             .order_by(Page.page_number)
             .all()
         )
+        if not pages:
+            logger.info("No pages found for book %s", book_id)
+            return
 
-        ner_chars = _extract_characters_from_pages(pages)
-        web_chars = _extract_characters_from_web(book.title)
-        merged = _merge_character_sets(ner_chars, web_chars)
-        merged = _collapse_aliases(merged)
-        merged = _filter_merged_characters(merged)
+        characters = _extract_characters_from_pages(pages)
+        characters = _collapse_aliases(characters)
+        characters = _filter_characters(characters)
 
+        db.query(PageCharacter).filter(PageCharacter.book_id == book_id).delete()
         db.query(Character).filter(Character.book_id == book_id).delete()
-        for char in merged.values():
-            db.add(Character(
+
+        stored_characters = 0
+        page_links = 0
+        for entry in characters.values():
+            character_record = Character(
                 book_id=book_id,
-                name=char["name"],
-                source=char["source"],
-                mention_count=char["mention_count"],
-                first_appearance_page=char["first_page"],
-                external_url=char.get("external_url")
-            ))
+                name=entry["name"],
+                aliases=json.dumps(sorted(entry["aliases"])),
+                visual_profile=_build_visual_profile(entry["descriptors"]),
+                source="ner",
+                mention_count=entry["mention_count"],
+                first_appearance_page=entry["first_page"],
+                external_url=None,
+            )
+            db.add(character_record)
+            db.flush()
+            stored_characters += 1
+
+            for page_id, mention in entry["page_mentions"].items():
+                confidence = mention["confidence_sum"] / max(mention["mention_count"], 1)
+                if confidence < MIN_PAGE_CONFIDENCE:
+                    continue
+                db.add(
+                    PageCharacter(
+                        book_id=book_id,
+                        page_id=page_id,
+                        character_id=character_record.id,
+                        mention_count=mention["mention_count"],
+                        confidence=min(1.0, confidence),
+                    )
+                )
+                page_links += 1
+
         db.commit()
-        logger.info("Stored %s characters for book %s", len(merged), book_id)
+        logger.info(
+            "Stored %s characters and %s page links for book %s",
+            stored_characters,
+            page_links,
+            book_id,
+        )
 
     except Exception:
         db.rollback()
@@ -90,207 +137,41 @@ def _extract_characters_from_pages(pages: Iterable[Page]) -> dict[str, dict]:
             if ent.label_ != "PERSON":
                 continue
 
-            name = ent.text.strip()
-            normalized = _normalize_name(name)
+            raw_name = ent.text.strip()
+            normalized = _normalize_name(raw_name)
             if not normalized:
                 continue
 
-            entry = entries.setdefault(normalized, {
-                "name": name,
-                "mention_count": 0,
-                "first_page": None,
-                "source": "ner",
-                "external_url": None,
-            })
+            entry = entries.setdefault(
+                normalized,
+                {
+                    "name": raw_name,
+                    "aliases": {raw_name},
+                    "alias_norms": {normalized},
+                    "mention_count": 0,
+                    "first_page": None,
+                    "descriptors": Counter(),
+                    "page_mentions": {},
+                },
+            )
 
+            if len(raw_name) > len(entry["name"]):
+                entry["name"] = raw_name
+            entry["aliases"].add(raw_name)
+            entry["alias_norms"].add(normalized)
             entry["mention_count"] += 1
-            if entry["first_page"] is None or (page.page_number and page.page_number < entry["first_page"]):
-                entry["first_page"] = page.page_number
+            entry["first_page"] = _earliest_page(entry["first_page"], page.page_number)
 
-    return entries
+            for descriptor in _extract_visual_descriptors(ent.sent.text):
+                entry["descriptors"][descriptor] += 1
 
+            mention = entry["page_mentions"].setdefault(
+                page.id,
+                {"mention_count": 0, "confidence_sum": 0.0},
+            )
+            mention["mention_count"] += 1
+            mention["confidence_sum"] += _estimate_mention_confidence(raw_name)
 
-WIKI_SEARCH_URL = "https://en.wikipedia.org/w/api.php?action=opensearch&search={query}&limit=1&format=json"
-
-
-def _extract_characters_from_web(title: str) -> dict[str, dict]:
-    names, source_url = _extract_characters_from_search(title)
-    if names:
-        return _build_web_entries(names, source_url, source="web-search")
-
-    summary, url = _fetch_wikipedia_summary(title)
-    if not summary:
-        logger.info("No web enrichment data found for %s", title)
-        return {}
-
-    doc = _nlp(summary)
-    entries: dict[str, dict] = {}
-
-    for ent in doc.ents:
-        if ent.label_ != "PERSON":
-            continue
-        name = ent.text.strip()
-        normalized = _normalize_name(name)
-        if not normalized:
-            continue
-        entry = entries.setdefault(normalized, {
-            "name": name,
-            "mention_count": 0,
-            "first_page": None,
-            "source": "web",
-            "external_url": url
-        })
-        entry["mention_count"] += 1
-
-    return entries
-
-
-def _extract_characters_from_search(title: str) -> tuple[list[str], Optional[str]]:
-    query = f"{title} characters"
-    urls = _fetch_search_urls(query, SEARCH_RESULT_LIMIT)
-    if not urls:
-        return [], None
-
-    logger.info("DuckDuckGo returned %s candidate links for %s", len(urls), title)
-    name_counter = Counter()
-    for url in urls:
-        text = _fetch_web_text(url)
-        if not text:
-            continue
-        name_counter.update(NAME_PATTERN.findall(text))
-
-    if not name_counter:
-        return [], None
-
-    most_common = [name for name, _ in name_counter.most_common(25)]
-    return most_common, urls[0]
-
-
-def _fetch_search_urls(query: str, limit: int) -> list[str]:
-    try:
-        response = requests.get(DDG_SEARCH_URL, params={"q": query}, headers=SEARCH_HEADERS, timeout=8)
-        if response.status_code != 200:
-            logger.debug("DuckDuckGo search failed (%s) for %s", response.status_code, query)
-            return []
-
-        soup = BeautifulSoup(response.text, "lxml")
-        anchors = soup.select(".result__a")
-        urls = []
-        for anchor in anchors:
-            href = anchor.get("href")
-            if href and href.startswith("http"):
-                urls.append(href)
-            if len(urls) >= limit:
-                break
-        return urls
-
-    except requests.RequestException as exc:
-        logger.warning("DuckDuckGo search error for %s: %s", query, exc)
-        return []
-
-
-def _fetch_web_text(url: str) -> str:
-    try:
-        resp = requests.get(url, headers=SEARCH_HEADERS, timeout=8)
-        if resp.status_code != 200:
-            return ""
-        soup = BeautifulSoup(resp.text, "lxml")
-        fragments = []
-        for tag in soup.select("li, p, h2, h3, h4"):
-            text = tag.get_text(" ", strip=True)
-            if text:
-                fragments.append(text)
-        return " ".join(fragments)
-    except requests.RequestException:
-        return ""
-
-
-def _fetch_wikipedia_summary(title: str) -> tuple[Optional[str], Optional[str]]:
-    slug = quote(title.replace(" ", "_"))
-    summary, url = _fetch_summary_for_slug(slug)
-    if summary:
-        return summary, url
-
-    logger.debug("Primary summary missing for %s, trying search", title)
-    alternate = _search_wikipedia_slug(title)
-    if not alternate:
-        return None, None
-
-    return _fetch_summary_for_slug(alternate)
-
-
-def _fetch_summary_for_slug(slug: str) -> tuple[Optional[str], Optional[str]]:
-    api_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{slug}"
-    headers = {"User-Agent": "Booktures Character Extractor"}
-
-    try:
-        response = requests.get(api_url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            logger.debug("Wikipedia summary request failed for slug %s (%s)", slug, response.status_code)
-            return None, None
-        data = response.json()
-        extract = data.get("extract", "")
-        page_url = data.get("content_urls", {}).get("desktop", {}).get("page")
-        return extract, page_url
-
-    except requests.RequestException as exc:
-        logger.warning("Wikipedia fetch failed for slug %s: %s", slug, exc)
-        return None, None
-
-
-def _search_wikipedia_slug(title: str) -> Optional[str]:
-    query = quote(title)
-    search_url = WIKI_SEARCH_URL.format(query=query)
-    try:
-        resp = requests.get(search_url, timeout=5)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if len(data) >= 2 and data[1]:
-            return quote(data[1][0].replace(" ", "_"))
-    except requests.RequestException as exc:
-        logger.warning("Wikipedia search failed for %s: %s", title, exc)
-    return None
-
-
-def _merge_character_sets(primary: dict[str, dict], secondary: dict[str, dict]) -> dict[str, dict]:
-    merged = {**primary}
-
-    for norm, secondary_entry in secondary.items():
-        best_match = None
-        best_score = 0
-
-        for existing_norm, entry in merged.items():
-            score = fuzz.token_sort_ratio(secondary_entry["name"], entry["name"])
-            if score > best_score:
-                best_score = score
-                best_match = existing_norm
-
-        if best_score >= MATCH_THRESHOLD and best_match:
-            entry = merged[best_match]
-            entry["mention_count"] += secondary_entry["mention_count"]
-            entry["source"] = "ner+web"
-            entry["external_url"] = secondary_entry.get("external_url") or entry.get("external_url")
-        else:
-            merged[norm] = secondary_entry
-
-    return merged
-
-
-def _build_web_entries(names: list[str], source_url: Optional[str], source: str) -> dict[str, dict]:
-    entries: dict[str, dict] = {}
-    for name in names:
-        normalized = _normalize_name(name)
-        if not normalized:
-            continue
-        entry = entries.setdefault(normalized, {
-            "name": name,
-            "mention_count": 0,
-            "first_page": None,
-            "source": source,
-            "external_url": source_url
-        })
-        entry["mention_count"] += 1
     return entries
 
 
@@ -300,24 +181,103 @@ def _collapse_aliases(characters: dict[str, dict]) -> dict[str, dict]:
     while pending:
         norm, entry = max(pending.items(), key=lambda item: item[1]["mention_count"])
         pending.pop(norm, None)
-        duplicates = []
         for other_norm, other in list(pending.items()):
-            score = fuzz.token_sort_ratio(entry["name"], other["name"])
-            if score >= ALIAS_MATCH_SCORE:
-                duplicates.append((other_norm, other))
-        for other_norm, other in duplicates:
+            if _match_alias(entry, other) < ALIAS_MATCH_SCORE:
+                continue
             pending.pop(other_norm, None)
             entry["mention_count"] += other["mention_count"]
-            entry["first_page"] = _earliest_page(entry.get("first_page"), other.get("first_page"))
-            entry["source"] = (
-                "ner+web"
-                if entry["source"] in CANONICAL_SOURCES or other["source"] in CANONICAL_SOURCES
-                else entry["source"]
-            )
+            entry["first_page"] = _earliest_page(entry["first_page"], other["first_page"])
+            entry["aliases"].update(other["aliases"])
+            entry["alias_norms"].update(other["alias_norms"])
+            entry["descriptors"].update(other["descriptors"])
+            _merge_page_mentions(entry["page_mentions"], other["page_mentions"])
             if len(other["name"]) > len(entry["name"]):
                 entry["name"] = other["name"]
         collapsed[norm] = entry
     return collapsed
+
+
+def _match_alias(primary: dict, secondary: dict) -> float:
+    best = fuzz.token_set_ratio(primary["name"], secondary["name"])
+    for alias_a in primary["aliases"]:
+        for alias_b in secondary["aliases"]:
+            score = fuzz.token_set_ratio(alias_a, alias_b)
+            if score > best:
+                best = score
+    return best
+
+
+def _merge_page_mentions(primary: dict, secondary: dict):
+    for page_id, mention in secondary.items():
+        existing = primary.setdefault(page_id, {"mention_count": 0, "confidence_sum": 0.0})
+        existing["mention_count"] += mention["mention_count"]
+        existing["confidence_sum"] += mention["confidence_sum"]
+
+
+def _filter_characters(characters: dict[str, dict]) -> dict[str, dict]:
+    filtered: dict[str, dict] = {}
+    for norm, entry in characters.items():
+        if not entry["name"] or len(entry["name"]) < 3:
+            continue
+        words = entry["name"].split()
+        if len(words) > 5:
+            continue
+        if any(word.lower() in IGNORE_TOKENS for word in words):
+            continue
+        if entry["mention_count"] < MIN_TOTAL_MENTIONS:
+            continue
+        filtered[norm] = entry
+    return filtered
+
+
+def _extract_visual_descriptors(sentence: str) -> list[str]:
+    cleaned = sentence.replace("\n", " ").strip()
+    if not cleaned:
+        return []
+
+    descriptors = []
+    for match in VISUAL_PATTERN.findall(cleaned):
+        token = match.lower().strip()
+        if token and token not in STOP_DESCRIPTOR_WORDS:
+            descriptors.append(token)
+    return descriptors
+
+
+def _build_visual_profile(descriptors: Counter) -> Optional[str]:
+    if not descriptors:
+        return None
+    top_descriptors = _select_visual_descriptors(descriptors, max_traits=3)
+    if not top_descriptors:
+        return None
+    return ", ".join(top_descriptors)
+
+
+def _select_visual_descriptors(descriptors: Counter, max_traits: int) -> list[str]:
+    selected: list[str] = []
+    for descriptor, _ in descriptors.most_common(12):
+        if _conflicts_with_selected(descriptor, selected):
+            continue
+        selected.append(descriptor)
+        if len(selected) >= max_traits:
+            break
+    return selected
+
+
+def _conflicts_with_selected(candidate: str, selected: list[str]) -> bool:
+    for group in VISUAL_CONFLICT_GROUPS:
+        if candidate not in group:
+            continue
+        if any(existing in group for existing in selected):
+            return True
+    return False
+
+
+def _estimate_mention_confidence(name: str) -> float:
+    tokens = [tok for tok in name.split() if tok]
+    confidence = 0.55 + (0.08 * min(len(tokens), 3))
+    if any(tok.isupper() for tok in tokens):
+        confidence += 0.05
+    return min(1.0, confidence)
 
 
 def _earliest_page(a: Optional[int], b: Optional[int]) -> Optional[int]:
@@ -328,30 +288,106 @@ def _earliest_page(a: Optional[int], b: Optional[int]) -> Optional[int]:
     return min(a, b)
 
 
-def _filter_merged_characters(characters: dict[str, dict]) -> dict[str, dict]:
-    filtered: dict[str, dict] = {}
-    for norm, entry in characters.items():
-        if not entry["name"] or len(entry["name"]) < 3:
-            continue
-        words = entry["name"].split()
-        if any(word.lower() in IGNORE_TOKENS for word in words):
-            continue
-        if entry["source"] == "ner" and entry["mention_count"] < MIN_NER_MENTIONS:
-            continue
-        if entry["mention_count"] < MIN_TOTAL_MENTIONS and entry["source"] not in CANONICAL_SOURCES:
-            continue
-        filtered[norm] = entry
-    return filtered
-
-
 def _normalize_name(name: str) -> str:
-    cleaned = re.sub(r"[^\w\s]", "", name)
+    name = re.sub(r"[’']s\b", "", name)
+    cleaned = re.sub(r"[^\w\s\-']", "", name)
     cleaned = re.sub(r"\s+", " ", cleaned)
-    stripped = _strip_titles(cleaned)
-    return stripped.strip().lower()
+    stripped = _strip_titles(cleaned).strip()
+    if not stripped:
+        return ""
+    tokens = stripped.split()
+    if any(tok.lower() in IGNORE_TOKENS for tok in tokens):
+        return ""
+    return stripped.lower()
 
 
 def _strip_titles(name: str) -> str:
-    tokens = [tok for tok in name.split() if tok.lower() not in TITLE_TOKENS]
+    tokens = [tok for tok in name.split() if tok.lower().strip(".") not in TITLE_TOKENS]
     return " ".join(tokens)
 
+
+def resolve_page_characters(page: Page, characters: list[Character]) -> list[dict]:
+    """Fallback linker for pages without persisted page_character rows."""
+    if not page.text:
+        return []
+
+    doc = _nlp(page.text)
+    mentions: dict[int, dict] = {}
+    character_aliases = _build_character_alias_index(characters)
+
+    for ent in doc.ents:
+        if ent.label_ != "PERSON":
+            continue
+        normalized = _normalize_name(ent.text)
+        if not normalized:
+            continue
+        best_character_id, best_score = _best_character_match(normalized, character_aliases)
+        if best_character_id is None or best_score < PAGE_LINK_MATCH_SCORE:
+            continue
+
+        mention = mentions.setdefault(
+            best_character_id,
+            {"mention_count": 0, "confidence_sum": 0.0},
+        )
+        mention["mention_count"] += 1
+        mention["confidence_sum"] += best_score / 100.0
+
+    resolved = []
+    for character in characters:
+        mention = mentions.get(character.id)
+        if not mention:
+            continue
+        confidence = mention["confidence_sum"] / mention["mention_count"]
+        if confidence < MIN_PAGE_CONFIDENCE:
+            continue
+        resolved.append(
+            {
+                "character_id": character.id,
+                "name": character.name,
+                "mention_count": mention["mention_count"],
+                "confidence": min(1.0, confidence),
+                "visual_profile": character.visual_profile or "",
+            }
+        )
+    return resolved
+
+
+def _build_character_alias_index(characters: list[Character]) -> dict[int, list[str]]:
+    alias_index: dict[int, list[str]] = {}
+    for character in characters:
+        aliases = _read_aliases(character.aliases)
+        aliases.append(character.name)
+        normalized_aliases = []
+        for alias in aliases:
+            normalized = _normalize_name(alias)
+            if normalized:
+                normalized_aliases.append(normalized)
+        alias_index[character.id] = normalized_aliases
+    return alias_index
+
+
+def _best_character_match(
+    normalized_name: str,
+    character_aliases: dict[int, list[str]],
+) -> tuple[Optional[int], float]:
+    best_character_id: Optional[int] = None
+    best_score = 0.0
+    for character_id, aliases in character_aliases.items():
+        for alias in aliases:
+            score = fuzz.token_set_ratio(normalized_name, alias)
+            if score > best_score:
+                best_score = score
+                best_character_id = character_id
+    return best_character_id, best_score
+
+
+def _read_aliases(raw_aliases: Optional[str]) -> list[str]:
+    if not raw_aliases:
+        return []
+    try:
+        aliases = json.loads(raw_aliases)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(aliases, list):
+        return []
+    return [str(alias) for alias in aliases if alias]

@@ -9,6 +9,7 @@ from models.book import Book
 from models.page import Page
 from services.pdf_service import save_pdf, extract_text_by_page
 from services.character_service import build_character_registry
+from services.prompt_service import build_page_visual_prompt
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -158,3 +159,11 @@ def get_page(book_id: int, page_number: int):
 
     finally:
         db.close()
+
+
+@router.get("/books/{book_id}/pages/{page_number}/visual-prompt")
+def get_page_visual_prompt(book_id: int, page_number: int):
+    data = build_page_visual_prompt(book_id, page_number)
+    if data["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Page not found")
+    return data

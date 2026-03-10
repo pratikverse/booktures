@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey
+from sqlalchemy import Column, Integer, String, ForeignKey, Text
 from database import Base
 
 
@@ -12,3 +12,5 @@ class Character(Base):
     mention_count = Column(Integer, default=0)
     first_appearance_page = Column(Integer, nullable=True)
     external_url = Column(String, nullable=True)
+    aliases = Column(Text, nullable=True)  # JSON-encoded alias list
+    visual_profile = Column(Text, nullable=True)
