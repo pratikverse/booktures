@@ -19,6 +19,7 @@ JOB_BOOK_PIPELINE = "book_pipeline"
 JOB_PAGE_IMAGE = "page_image"
 JOB_BOOK_EVALUATION = "book_evaluation"
 JOB_PAGE_PROMPT = "page_prompt"
+JOB_BOOK_IMAGES = "book_images"
 
 _worker_thread: Optional[threading.Thread] = None
 _worker_stop_event = threading.Event()
@@ -129,6 +130,24 @@ def enqueue_book_evaluation(book_id: int, sample_size: int = 25) -> int:
     )
 
 
+def enqueue_book_images(
+    book_id: int,
+    style_preset: str = DEFAULT_STYLE_PRESET,
+    force_prompt_refresh: bool = False,
+    force_regenerate: bool = False,
+) -> int:
+    return enqueue_job(
+        book_id=book_id,
+        job_type=JOB_BOOK_IMAGES,
+        payload={
+            "style_preset": style_preset,
+            "force_prompt_refresh": force_prompt_refresh,
+            "force_regenerate": force_regenerate,
+        },
+        max_attempts=2,
+    )
+
+
 def get_job(job_id: int) -> Optional[dict]:
     db = SessionLocal()
     try:
@@ -174,25 +193,41 @@ def _claim_next_job() -> Optional[GenerationJob]:
 
 
 def _run_job(job_id: int):
-    db = SessionLocal()
+    job: Optional[GenerationJob] = None
+    payload: dict = {}
     try:
-        job = db.get(GenerationJob, job_id)
-        if job is None:
-            return
-        payload = _read_payload(job.payload)
-        result = _dispatch_job(job, payload)
-        job.status = "completed"
-        job.progress = 1.0
-        job.result = json.dumps(result)
-        job.completed_at = datetime.utcnow()
-        job.last_error = None
-        db.add(job)
-        db.commit()
+        db = SessionLocal()
+        try:
+            job = db.get(GenerationJob, job_id)
+            if job is None:
+                return
+            payload = _read_payload(job.payload)
+            book_id = job.book_id
+            page_id = job.page_id
+            job_type = job.job_type
+        finally:
+            db.close()
+
+        # Run long work outside of any open job-tracking transaction.
+        temp_job = GenerationJob(id=job_id, book_id=book_id, page_id=page_id, job_type=job_type)
+        result = _dispatch_job(temp_job, payload)
+
+        db = SessionLocal()
+        try:
+            job = db.get(GenerationJob, job_id)
+            if job is None:
+                return
+            job.status = "completed"
+            job.progress = 1.0
+            job.result = json.dumps(result)
+            job.completed_at = datetime.utcnow()
+            job.last_error = None
+            db.add(job)
+            db.commit()
+        finally:
+            db.close()
     except Exception as exc:
-        db.rollback()
         _mark_job_failure(job_id, str(exc))
-    finally:
-        db.close()
 
 
 def _dispatch_job(job: GenerationJob, payload: dict) -> dict:
@@ -253,6 +288,47 @@ def _dispatch_job(job: GenerationJob, payload: dict) -> dict:
         sample_size = int(payload.get("sample_size", 25))
         result = evaluate_book_prompts(book_id=job.book_id, sample_size=sample_size, force_refresh=False)
         return result
+
+    if job.job_type == JOB_BOOK_IMAGES:
+        style_preset = payload.get("style_preset", DEFAULT_STYLE_PRESET)
+        force_prompt_refresh = bool(payload.get("force_prompt_refresh", False))
+        force_regenerate = bool(payload.get("force_regenerate", False))
+        db = SessionLocal()
+        try:
+            pages = (
+                db.query(Page)
+                .filter(Page.book_id == job.book_id)
+                .order_by(Page.page_number.asc())
+                .all()
+            )
+        finally:
+            db.close()
+
+        total = max(len(pages), 1)
+        generated = 0
+        failed = 0
+        for idx, page in enumerate(pages, start=1):
+            result = generate_page_image(
+                book_id=job.book_id,
+                page_number=page.page_number,
+                style_preset=style_preset,
+                force_prompt_refresh=force_prompt_refresh,
+                force_regenerate=force_regenerate,
+            )
+            status = result.get("status")
+            if status in {"generated", "already_generated"}:
+                generated += 1
+            elif status in {"failed", "prompt_unavailable", "not_found"}:
+                failed += 1
+            progress = idx / total
+            _update_job_progress(job.id, progress, f"page_{page.page_number}_{status}")
+
+        return {
+            "book_id": job.book_id,
+            "total_pages": len(pages),
+            "generated": generated,
+            "failed": failed,
+        }
 
     raise ValueError(f"Unsupported job_type: {job.job_type}")
 

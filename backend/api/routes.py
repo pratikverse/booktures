@@ -11,12 +11,21 @@ from models.page_asset import PageAsset
 from services.pdf_service import save_pdf, extract_text_by_page
 from services.generation_queue_service import (
     enqueue_book_pipeline,
+    enqueue_book_images,
     enqueue_page_image,
     get_job,
 )
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def db_book_exists(book_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        return db.get(Book, book_id) is not None
+    finally:
+        db.close()
 
 
 def _page_exists(book_id: int, page_number: int) -> bool:
@@ -119,6 +128,12 @@ class PageImageRequest(BaseModel):
     force_regenerate: bool = False
 
 
+class BookImagesRequest(BaseModel):
+    style_preset: str = "storybook"
+    force_prompt_refresh: bool = False
+    force_regenerate: bool = False
+
+
 @router.post("/import-pdf")
 def import_pdf_from_url(
     data: PDFUrlRequest,
@@ -173,6 +188,19 @@ def queue_page_image(book_id: int, page_number: int, body: PageImageRequest):
         force_regenerate=body.force_regenerate,
     )
     return {"status": "queued", "job_id": job_id, "book_id": book_id, "page_number": page_number}
+
+
+@router.post("/books/{book_id}/generate-images")
+def queue_book_images(book_id: int, body: BookImagesRequest):
+    if not db_book_exists(book_id):
+        raise HTTPException(status_code=404, detail="Book not found")
+    job_id = enqueue_book_images(
+        book_id=book_id,
+        style_preset=body.style_preset,
+        force_prompt_refresh=body.force_prompt_refresh,
+        force_regenerate=body.force_regenerate,
+    )
+    return {"status": "queued", "job_id": job_id, "book_id": book_id}
 
 
 @router.get("/books/{book_id}/pages/{page_number}/asset")

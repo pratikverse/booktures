@@ -1,12 +1,18 @@
-from sqlalchemy import create_engine
+import os
+from pathlib import Path
+
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# SQLite for development (Postgres later)
-DATABASE_URL = "sqlite:///./booktures.db"
+# SQLite for development (Postgres later).
+# Anchor the default DB file to this repository directory so startup CWD does not
+# accidentally create/use a different SQLite file.
+_DEFAULT_SQLITE_PATH = (Path(__file__).resolve().parent / "booktures.db").as_posix()
+DATABASE_URL = os.getenv("BOOKTURES_DATABASE_URL", f"sqlite:///{_DEFAULT_SQLITE_PATH}")
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False}
+    connect_args={"check_same_thread": False, "timeout": 30}
 )
 
 # Session factory
@@ -18,6 +24,16 @@ SessionLocal = sessionmaker(
 
 # Base class for models
 Base = declarative_base()
+
+
+if DATABASE_URL.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+        cursor.execute("PRAGMA busy_timeout=30000;")
+        cursor.close()
 
 
 def ensure_sqlite_schema():

@@ -1,5 +1,7 @@
 import io
 import logging
+import os
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -11,11 +13,11 @@ from services.prompt_service import build_page_visual_prompt, DEFAULT_STYLE_PRES
 logger = logging.getLogger(__name__)
 
 IMAGE_STORAGE_ROOT = Path("storage/images")
-DEFAULT_WIDTH = 768
-DEFAULT_HEIGHT = 1024
-DEFAULT_STEPS = 24
-DEFAULT_GUIDANCE = 7.0
-DEFAULT_IMAGE_MODEL = "stabilityai/stable-diffusion-2-base"
+DEFAULT_WIDTH = int(os.getenv("BOOKTURES_SD_WIDTH", "512"))
+DEFAULT_HEIGHT = int(os.getenv("BOOKTURES_SD_HEIGHT", "768"))
+DEFAULT_STEPS = int(os.getenv("BOOKTURES_SD_STEPS", "4"))
+DEFAULT_GUIDANCE = float(os.getenv("BOOKTURES_SD_GUIDANCE", "0.0"))
+DEFAULT_IMAGE_MODEL = os.getenv("BOOKTURES_SD_MODEL", "stabilityai/sd-turbo")
 
 _pipeline = None
 _torch = None
@@ -150,6 +152,9 @@ def _render_with_diffusers(prompt: str, negative_prompt: str):
     pipeline = _get_pipeline()
     if pipeline is None:
         return None
+    prompt = _clip_safe_prompt(prompt, pipeline)
+    negative_prompt = _clip_safe_prompt(negative_prompt, pipeline) if negative_prompt else ""
+    context = _torch.autocast("cuda") if _device is not None and _device.type == "cuda" else nullcontext()
     kwargs = {
         "prompt": prompt,
         "negative_prompt": negative_prompt or None,
@@ -158,7 +163,8 @@ def _render_with_diffusers(prompt: str, negative_prompt: str):
         "width": DEFAULT_WIDTH,
         "height": DEFAULT_HEIGHT,
     }
-    result = pipeline(**kwargs)
+    with context:
+        result = pipeline(**kwargs)
     if not result or not getattr(result, "images", None):
         return None
     return result.images[0]
@@ -181,8 +187,41 @@ def _get_pipeline():
         DEFAULT_IMAGE_MODEL,
         torch_dtype=dtype,
     )
+    if _device.type == "cuda":
+        _pipeline.enable_attention_slicing()
+        try:
+            _pipeline.enable_xformers_memory_efficient_attention()
+        except Exception:
+            logger.debug("xformers attention unavailable, using default attention")
     _pipeline = _pipeline.to(_device)
     return _pipeline
+
+
+def _clip_safe_prompt(text: str, pipeline) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    tokenizer = getattr(pipeline, "tokenizer", None)
+    if tokenizer is None:
+        # Conservative fallback when tokenizer is unavailable.
+        return " ".join(cleaned.split()[:55]).strip()
+    try:
+        max_len = int(getattr(tokenizer, "model_max_length", 77) or 77)
+        encoded = tokenizer(
+            cleaned,
+            truncation=True,
+            max_length=max_len,
+            add_special_tokens=True,
+        )
+        input_ids = encoded.get("input_ids")
+        if not input_ids:
+            return cleaned
+        if isinstance(input_ids[0], list):
+            input_ids = input_ids[0]
+        decoded = tokenizer.decode(input_ids, skip_special_tokens=True).strip()
+        return decoded or cleaned
+    except Exception:
+        return cleaned
 
 
 def _render_placeholder(prompt: str):
