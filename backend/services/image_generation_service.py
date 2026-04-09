@@ -13,17 +13,13 @@ from services.prompt_service import build_page_visual_prompt, DEFAULT_STYLE_PRES
 logger = logging.getLogger(__name__)
 
 IMAGE_STORAGE_ROOT = Path("storage/images")
-DEFAULT_WIDTH = int(os.getenv("BOOKTURES_SD_WIDTH", "512"))
-DEFAULT_HEIGHT = int(os.getenv("BOOKTURES_SD_HEIGHT", "768"))
-DEFAULT_STEPS = int(os.getenv("BOOKTURES_SD_STEPS", "4"))
-DEFAULT_GUIDANCE = float(os.getenv("BOOKTURES_SD_GUIDANCE", "0.0"))
-DEFAULT_IMAGE_MODEL = os.getenv("BOOKTURES_SD_MODEL", "stabilityai/sd-turbo")
 
 _pipeline = None
 _torch = None
 _device = None
 _PIL_Image = None
 _PIL_ImageDraw = None
+_pipeline_model_name = None
 
 
 def generate_page_image(
@@ -65,7 +61,8 @@ def generate_page_image(
                 "page_number": page_number,
             }
 
-        prompt = prompt_data["visual_prompt"]
+        auto_prompt = prompt_data["visual_prompt"]
+        prompt = (asset.prompt_override if asset and asset.prompt_override else auto_prompt)
         negative_prompt = prompt_data.get("negative_prompt", "")
         image_bytes = _generate_image_bytes(prompt, negative_prompt)
         image_path = _save_image_bytes(book_id, page_number, image_bytes)
@@ -78,7 +75,10 @@ def generate_page_image(
                 page_number=page.page_number,
             )
         asset.scene_summary = prompt_data.get("scene_summary", asset.scene_summary)
-        asset.visual_prompt = prompt
+        asset.summary_short = prompt_data.get("summary_short", getattr(asset, "summary_short", None))
+        asset.continuity_summary = prompt_data.get("continuity_summary", getattr(asset, "continuity_summary", None))
+        asset.visual_prompt = auto_prompt
+        asset.last_used_prompt = prompt
         asset.negative_prompt = negative_prompt
         asset.style_preset = prompt_data.get("style_preset", style_preset)
         asset.image_path = str(image_path)
@@ -138,6 +138,12 @@ def _save_image_bytes(book_id: int, page_number: int, image_bytes: bytes) -> Pat
     return image_path
 
 
+def reset_pipeline():
+    global _pipeline, _pipeline_model_name
+    _pipeline = None
+    _pipeline_model_name = None
+
+
 def _generate_image_bytes(prompt: str, negative_prompt: str) -> bytes:
     image = _render_with_diffusers(prompt, negative_prompt)
     if image is None:
@@ -152,16 +158,20 @@ def _render_with_diffusers(prompt: str, negative_prompt: str):
     pipeline = _get_pipeline()
     if pipeline is None:
         return None
+    width = int(os.getenv("BOOKTURES_SD_WIDTH", "512"))
+    height = int(os.getenv("BOOKTURES_SD_HEIGHT", "768"))
+    steps = int(os.getenv("BOOKTURES_SD_STEPS", "6"))
+    guidance = float(os.getenv("BOOKTURES_SD_GUIDANCE", "8.5"))
     prompt = _clip_safe_prompt(prompt, pipeline)
     negative_prompt = _clip_safe_prompt(negative_prompt, pipeline) if negative_prompt else ""
     context = _torch.autocast("cuda") if _device is not None and _device.type == "cuda" else nullcontext()
     kwargs = {
         "prompt": prompt,
         "negative_prompt": negative_prompt or None,
-        "num_inference_steps": DEFAULT_STEPS,
-        "guidance_scale": DEFAULT_GUIDANCE,
-        "width": DEFAULT_WIDTH,
-        "height": DEFAULT_HEIGHT,
+        "num_inference_steps": steps,
+        "guidance_scale": guidance,
+        "width": width,
+        "height": height,
     }
     with context:
         result = pipeline(**kwargs)
@@ -171,29 +181,39 @@ def _render_with_diffusers(prompt: str, negative_prompt: str):
 
 
 def _get_pipeline():
-    global _pipeline, _torch, _device
-    if _pipeline is not None:
+    global _pipeline, _torch, _device, _pipeline_model_name
+    image_model = os.getenv("BOOKTURES_SD_MODEL", "segmind/SSD-1B")
+    if _pipeline is not None and _pipeline_model_name == image_model:
         return _pipeline
     try:
         import torch as torch_module
-        from diffusers import StableDiffusionPipeline
+        from diffusers import DiffusionPipeline
     except Exception:
         return None
 
     _torch = torch_module
     _device = torch_module.device("cuda" if torch_module.cuda.is_available() else "cpu")
     dtype = torch_module.float16 if _device.type == "cuda" else torch_module.float32
-    _pipeline = StableDiffusionPipeline.from_pretrained(
-        DEFAULT_IMAGE_MODEL,
-        torch_dtype=dtype,
-    )
+    load_kwargs = {
+        "torch_dtype": dtype,
+        "use_safetensors": True,
+    }
+    if _device.type == "cuda":
+        load_kwargs["variant"] = "fp16"
+    _pipeline = DiffusionPipeline.from_pretrained(image_model, **load_kwargs)
+    _pipeline_model_name = image_model
     if _device.type == "cuda":
         _pipeline.enable_attention_slicing()
+        try:
+            _pipeline.enable_model_cpu_offload()
+        except Exception:
+            logger.debug("CPU offload unavailable, keeping pipeline on GPU")
         try:
             _pipeline.enable_xformers_memory_efficient_attention()
         except Exception:
             logger.debug("xformers attention unavailable, using default attention")
-    _pipeline = _pipeline.to(_device)
+    else:
+        _pipeline = _pipeline.to(_device)
     return _pipeline
 
 
@@ -201,32 +221,42 @@ def _clip_safe_prompt(text: str, pipeline) -> str:
     cleaned = (text or "").strip()
     if not cleaned:
         return ""
-    tokenizer = getattr(pipeline, "tokenizer", None)
-    if tokenizer is None:
+    tokenizers = [
+        getattr(pipeline, "tokenizer", None),
+        getattr(pipeline, "tokenizer_2", None),
+    ]
+    tokenizers = [tokenizer for tokenizer in tokenizers if tokenizer is not None]
+    if not tokenizers:
         # Conservative fallback when tokenizer is unavailable.
-        return " ".join(cleaned.split()[:55]).strip()
-    try:
-        max_len = int(getattr(tokenizer, "model_max_length", 77) or 77)
-        encoded = tokenizer(
-            cleaned,
-            truncation=True,
-            max_length=max_len,
-            add_special_tokens=True,
-        )
-        input_ids = encoded.get("input_ids")
-        if not input_ids:
-            return cleaned
-        if isinstance(input_ids[0], list):
-            input_ids = input_ids[0]
-        decoded = tokenizer.decode(input_ids, skip_special_tokens=True).strip()
-        return decoded or cleaned
-    except Exception:
-        return cleaned
+        return " ".join(cleaned.split()[:90]).strip()
+    shortest = cleaned
+    for tokenizer in tokenizers:
+        try:
+            max_len = int(getattr(tokenizer, "model_max_length", 77) or 77)
+            encoded = tokenizer(
+                cleaned,
+                truncation=True,
+                max_length=max_len,
+                add_special_tokens=True,
+            )
+            input_ids = encoded.get("input_ids")
+            if not input_ids:
+                continue
+            if isinstance(input_ids[0], list):
+                input_ids = input_ids[0]
+            decoded = tokenizer.decode(input_ids, skip_special_tokens=True).strip()
+            if decoded and len(decoded) < len(shortest):
+                shortest = decoded
+        except Exception:
+            continue
+    return shortest
 
 
 def _render_placeholder(prompt: str):
     image_module, draw_module = _get_pillow_modules()
-    image = image_module.new("RGB", (DEFAULT_WIDTH, DEFAULT_HEIGHT), color=(25, 28, 34))
+    width = int(os.getenv("BOOKTURES_SD_WIDTH", "512"))
+    height = int(os.getenv("BOOKTURES_SD_HEIGHT", "768"))
+    image = image_module.new("RGB", (width, height), color=(25, 28, 34))
     draw = draw_module.Draw(image)
     text = _wrap_text(f"Preview image\n{prompt}", width=75)
     draw.text((30, 30), text, fill=(240, 240, 240))

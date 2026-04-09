@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String
+from sqlalchemy import Column, Integer, String, DateTime, func
 from database import Base
 
 class Book(Base):
@@ -8,5 +8,7 @@ class Book(Base):
     title = Column(String, index=True)
     total_pages = Column(Integer)
     source = Column(String) #local/web
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
     

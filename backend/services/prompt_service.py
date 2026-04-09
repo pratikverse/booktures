@@ -15,33 +15,31 @@ from services.character_service import resolve_page_characters
 
 logger = logging.getLogger(__name__)
 
-MAX_SCENE_CHARS = 1200
-MAX_PROMPT_CHARS = 700
-MAX_PROMPT_WORDS = 130
+PROMPT_PIPELINE_MARKER = "continuity anchor:"
+MAX_SCENE_CHARS = 1500
+MAX_PROMPT_CHARS = 1400
+MAX_PROMPT_WORDS = 220
 MAX_CHARACTERS_PER_PAGE = 4
-SUMMARY_CONTEXT_LIMIT = 2400
-MAX_SCENE_ACTIONS = 3
-MAX_SCENE_OBJECTS = 5
-MAX_SCENE_SUMMARY_SENTENCES = 4
-MAX_ENV_FIELD_CHARS = 140
-MAX_CLIP_WORDS = 60
-MAX_PROMPT_SCENE_WORDS = 26
-OLLAMA_URL = os.getenv("BOOKTURES_OLLAMA_URL", "http://127.0.0.1:11434/v1/chat/completions")
-OLLAMA_MODEL = os.getenv("BOOKTURES_OLLAMA_MODEL", "qwen2.5:3b-instruct")
-OLLAMA_TIMEOUT = int(os.getenv("BOOKTURES_OLLAMA_TIMEOUT", "35"))
+SUMMARY_CONTEXT_LIMIT = 6000
+CONTINUITY_PAGE_WINDOW = 3
+PREVIOUS_SUMMARY_CHARS = 320
+MAX_PAGE_BEATS = 4
+MAX_KEY_OBJECTS = 6
+MAX_CHARACTER_MOMENTS = 4
+MAX_FIELD_CHARS = 220
 DEFAULT_STYLE_PRESET = "storybook"
 
 STYLE_PRESETS = {
     "storybook": {
-        "style": "illustrated storybook style, cinematic composition, coherent character continuity",
+        "style": "illustrated storybook scene, cinematic composition, painterly detail, emotionally readable characters",
         "negative": "blurry, distorted face, extra limbs, low detail, text watermark, logo",
     },
     "comic": {
-        "style": "graphic novel comic style, bold linework, dramatic lighting, coherent character continuity",
+        "style": "graphic novel panel aesthetic, bold linework, dramatic contrast, expressive acting",
         "negative": "photo-realistic skin, blur, extra fingers, watermark, gibberish text",
     },
     "cinematic": {
-        "style": "cinematic digital painting, volumetric light, rich atmosphere, coherent character continuity",
+        "style": "cinematic digital painting, atmospheric depth, expressive lighting, grounded character continuity",
         "negative": "flat lighting, low contrast, blur, deformed anatomy, watermark",
     },
 }
@@ -76,12 +74,15 @@ def build_page_visual_prompt(
             and asset.visual_prompt
             and asset.scene_summary
             and asset.style_preset == resolved_style
+            and _prompt_matches_current_pipeline(asset.visual_prompt)
         ):
             return {
                 "book_id": book_id,
                 "page_number": page_number,
                 "status": "ok",
                 "scene_summary": asset.scene_summary,
+                "summary_short": getattr(asset, "summary_short", None),
+                "continuity_summary": getattr(asset, "continuity_summary", None),
                 "visual_prompt": asset.visual_prompt,
                 "negative_prompt": asset.negative_prompt or "",
                 "style_preset": asset.style_preset,
@@ -90,15 +91,26 @@ def build_page_visual_prompt(
             }
 
         characters = _load_page_characters(db, book_id, page)
-        scene_details = _build_scene_details(page.text or "", page_number=page.page_number)
-        scene_summary = scene_details["summary"]
+        continuity_context = _build_continuity_context(db, book_id, page.page_number, characters)
+        page_summary = _build_page_summary(
+            page.text or "",
+            page_number=page.page_number,
+            continuity_context=continuity_context,
+            characters=characters,
+        )
+        scene_summary = page_summary["full_summary"]
+        summary_short = page_summary["condensed_summary"]
+        continuity_summary = continuity_context.get("previous_summary_text", "")[:MAX_SCENE_CHARS]
         visual_prompt, negative_prompt = _compose_visual_prompt(
-            scene_details,
-            characters,
-            resolved_style,
+            page_summary=page_summary,
+            continuity_context=continuity_context,
+            characters=characters,
+            style_preset=resolved_style,
         )
 
         asset.scene_summary = scene_summary
+        asset.summary_short = summary_short
+        asset.continuity_summary = continuity_summary
         asset.visual_prompt = visual_prompt
         asset.negative_prompt = negative_prompt
         asset.style_preset = resolved_style
@@ -112,6 +124,8 @@ def build_page_visual_prompt(
             "page_number": page_number,
             "status": "ok",
             "scene_summary": scene_summary,
+            "summary_short": summary_short,
+            "continuity_summary": continuity_summary,
             "visual_prompt": visual_prompt,
             "negative_prompt": negative_prompt,
             "style_preset": resolved_style,
@@ -174,95 +188,181 @@ def _load_page_characters(db, book_id: int, page: Page) -> list[dict]:
     return resolve_page_characters(page, all_characters)[:MAX_CHARACTERS_PER_PAGE]
 
 
-def _build_scene_details(text: str, page_number: int = 1) -> dict:
+def _build_continuity_context(db, book_id: int, page_number: int, characters: list[dict]) -> dict:
+    previous_pages = (
+        db.query(Page, PageAsset)
+        .outerjoin(PageAsset, PageAsset.page_id == Page.id)
+        .filter(Page.book_id == book_id, Page.page_number < page_number)
+        .order_by(Page.page_number.desc())
+        .limit(CONTINUITY_PAGE_WINDOW)
+        .all()
+    )
+
+    previous_summaries = []
+    for previous_page, asset in previous_pages:
+        summary = ""
+        if asset is not None and asset.scene_summary:
+            summary = asset.scene_summary
+        elif previous_page.text:
+            summary = _fallback_condensed_summary(previous_page.text)
+        summary = _normalize_inline_text(summary)
+        if summary:
+            previous_summaries.append(
+                {
+                    "page_number": previous_page.page_number,
+                    "summary": summary[:PREVIOUS_SUMMARY_CHARS],
+                }
+            )
+
+    previous_summaries.sort(key=lambda item: item["page_number"])
+
+    named_characters = []
+    for character in characters[:MAX_CHARACTERS_PER_PAGE]:
+        name = _normalize_inline_text(character.get("name", ""))
+        profile = _normalize_inline_text(character.get("visual_profile", ""))
+        if not name:
+            continue
+        if profile:
+            named_characters.append(f"{name}: {profile}")
+        else:
+            named_characters.append(name)
+
+    continuity_anchor = " | ".join(
+        f"p{item['page_number']}: {item['summary']}" for item in previous_summaries
+    )
+    return {
+        "previous_summaries": previous_summaries,
+        "previous_summary_text": continuity_anchor,
+        "character_anchor": "; ".join(named_characters),
+    }
+
+
+def _build_page_summary(
+    text: str,
+    page_number: int,
+    continuity_context: dict,
+    characters: list[dict],
+) -> dict:
     cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    page_kind = _classify_page_kind(cleaned, page_number)
     if not cleaned:
         return {
-            "summary": "",
+            "page_kind": "blank",
+            "full_summary": "",
+            "condensed_summary": "",
+            "page_beats": [],
+            "key_objects": [],
             "setting": "",
-            "tone": "",
-            "actions": [],
-            "objects": [],
             "location": "",
             "time_of_day": "",
             "lighting": "",
             "weather": "",
-            "camera_framing": "",
-            "background_details": "",
-            "character_blocking": "",
-            "shot_variation": _shot_variation_directive(page_number),
+            "mood": "",
+            "camera_focus": _shot_variation_directive(page_number),
+            "character_focus": [],
+            "continuity_anchor": continuity_context.get("previous_summary_text", "") or "opening page establish the world and cast",
+            "scene_change": "",
         }
 
-    details = _summarize_with_ollama(cleaned)
+    if page_kind != "story":
+        return _summarize_non_story_page(cleaned, page_number, page_kind, continuity_context)
+
+    details = _summarize_page_with_ollama(cleaned, continuity_context, characters)
     if not details:
-        details = _fallback_scene_details(cleaned)
+        details = _fallback_page_summary(cleaned, page_number, continuity_context, characters)
 
-    summary = _normalize_summary(details.get("summary", ""))
-    if not summary:
-        summary = _fallback_summary(cleaned)
-    details["summary"] = summary[:MAX_SCENE_CHARS]
-    details["setting"] = _normalize_inline_text(details.get("setting", ""))[:MAX_ENV_FIELD_CHARS]
-    details["tone"] = _normalize_inline_text(details.get("tone", ""))[:MAX_ENV_FIELD_CHARS]
-    details["actions"] = _normalize_list(details.get("actions", []), MAX_SCENE_ACTIONS)
-    details["objects"] = _normalize_list(details.get("objects", []), MAX_SCENE_OBJECTS)
-    details["location"] = _normalize_inline_text(details.get("location", ""))[:MAX_ENV_FIELD_CHARS]
-    details["time_of_day"] = _normalize_inline_text(details.get("time_of_day", ""))[:MAX_ENV_FIELD_CHARS]
-    details["lighting"] = _normalize_inline_text(details.get("lighting", ""))[:MAX_ENV_FIELD_CHARS]
-    details["weather"] = _normalize_inline_text(details.get("weather", ""))[:MAX_ENV_FIELD_CHARS]
-    details["camera_framing"] = _normalize_inline_text(details.get("camera_framing", ""))[:MAX_ENV_FIELD_CHARS]
-    details["background_details"] = _normalize_inline_text(details.get("background_details", ""))[:MAX_ENV_FIELD_CHARS]
-    details["character_blocking"] = _normalize_inline_text(details.get("character_blocking", ""))[:MAX_ENV_FIELD_CHARS]
-    details["shot_variation"] = _normalize_inline_text(details.get("shot_variation", ""))[:MAX_ENV_FIELD_CHARS]
-    details = _ensure_environment_details(details, cleaned)
-    if not details.get("shot_variation"):
-        details["shot_variation"] = _shot_variation_directive(page_number)
-    return details
+    full_summary = _normalize_summary(details.get("full_summary") or details.get("summary") or cleaned, max_sentences=6)
+    condensed_summary = _normalize_summary(details.get("condensed_summary") or details.get("visual_summary") or full_summary, max_sentences=3)
+    page_beats = _normalize_list(details.get("page_beats", []), MAX_PAGE_BEATS)
+    key_objects = _normalize_list(details.get("key_objects", []), MAX_KEY_OBJECTS)
+    character_focus = _normalize_list(details.get("character_focus", []), MAX_CHARACTER_MOMENTS)
+    continuity_anchor = _normalize_inline_text(details.get("continuity_anchor", ""))
+    scene_change = _normalize_inline_text(details.get("scene_change", ""))
+
+    normalized = {
+        "page_kind": page_kind,
+        "full_summary": full_summary[:SUMMARY_CONTEXT_LIMIT],
+        "condensed_summary": condensed_summary[:MAX_SCENE_CHARS],
+        "page_beats": page_beats,
+        "key_objects": key_objects,
+        "setting": _normalize_inline_text(details.get("setting", ""))[:MAX_FIELD_CHARS],
+        "location": _normalize_inline_text(details.get("location", ""))[:MAX_FIELD_CHARS],
+        "time_of_day": _normalize_inline_text(details.get("time_of_day", ""))[:MAX_FIELD_CHARS],
+        "lighting": _normalize_inline_text(details.get("lighting", ""))[:MAX_FIELD_CHARS],
+        "weather": _normalize_inline_text(details.get("weather", ""))[:MAX_FIELD_CHARS],
+        "mood": _normalize_inline_text(details.get("mood", ""))[:MAX_FIELD_CHARS],
+        "camera_focus": _normalize_inline_text(details.get("camera_focus", ""))[:MAX_FIELD_CHARS],
+        "character_focus": character_focus,
+        "continuity_anchor": continuity_anchor[:MAX_SCENE_CHARS],
+        "scene_change": scene_change[:MAX_FIELD_CHARS],
+    }
+    normalized = _ensure_page_summary_defaults(normalized, cleaned, page_number, continuity_context, characters)
+    return normalized
 
 
-def _summarize_with_ollama(text: str) -> dict:
-    context = text[:SUMMARY_CONTEXT_LIMIT]
+def _summarize_page_with_ollama(text: str, continuity_context: dict, characters: list[dict]) -> dict:
+    ollama_url = os.getenv("BOOKTURES_OLLAMA_URL", "http://127.0.0.1:11434/v1/chat/completions")
+    ollama_model = os.getenv("BOOKTURES_OLLAMA_MODEL", "granite3.2:8b")
+    ollama_timeout = int(os.getenv("BOOKTURES_OLLAMA_TIMEOUT", "45"))
+    character_lines = []
+    for character in characters[:MAX_CHARACTERS_PER_PAGE]:
+        name = _normalize_inline_text(character.get("name", ""))
+        profile = _normalize_inline_text(character.get("visual_profile", ""))
+        if not name:
+            continue
+        character_lines.append(f"- {name}: {profile or 'keep appearance stable from prior pages'}")
+    character_block = "\n".join(character_lines) or "- no reliable named characters detected"
+
+    previous_pages = continuity_context.get("previous_summaries", [])
+    previous_block = "\n".join(
+        f"- page {item['page_number']}: {item['summary']}" for item in previous_pages
+    ) or "- no prior page summaries available"
+
     output_schema = (
         "{"
-        "\"narrative_summary\":\"...\","
-        "\"visual_description\":\"...\","
-        "\"character_descriptions\":["
-        "{\"name\":\"...\",\"appearance\":\"...\",\"pose_and_expression\":\"...\"}"
-        "],"
-        "\"setting\":\"...\","
-        "\"time_of_day\":\"...\","
-        "\"weather_conditions\":\"...\","
-        "\"lighting_style\":\"...\","
-        "\"color_palette\":{\"primary_colors\":[\"...\"],\"accent_colors\":[\"...\"],\"mood_colors\":\"...\"},"
-        "\"camera_framing\":\"...\","
-        "\"composition\":\"...\","
-        "\"foreground_elements\":[\"...\"],"
-        "\"midground_elements\":[\"...\"],"
-        "\"background_elements\":[\"...\"],"
-        "\"actions_in_frame\":[\"...\"],"
-        "\"character_positioning\":\"...\","
-        "\"emotional_tone\":\"...\","
-        "\"art_style_reference\":\"...\","
-        "\"consistency_notes\":\"...\""
+        '"full_summary":"...",'
+        '"condensed_summary":"...",'
+        '"page_beats":["..."],'
+        '"key_objects":["..."],'
+        '"setting":"...",'
+        '"location":"...",'
+        '"time_of_day":"...",'
+        '"lighting":"...",'
+        '"weather":"...",'
+        '"mood":"...",'
+        '"camera_focus":"...",'
+        '"character_focus":["..."],'
+        '"continuity_anchor":"...",'
+        '"scene_change":"..."'
         "}"
     )
     payload = {
-        "model": OLLAMA_MODEL,
+        "model": ollama_model,
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "You are a visual scene extraction engine for story illustration. "
+                    "You condense a full book page into a visual summary for illustration planning. "
                     "Return valid JSON only using exactly the requested keys. "
-                    "Keep all fields concrete and visual. Avoid markdown."
+                    "Make the condensed summary specific to this page, with concrete imagery, actions, and changes from previous pages."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    "Extract the page into a rich visual planning JSON.\n\n"
-                    f"Page text:\n{context}\n\n"
-                    "Output format (exact keys): "
-                    f"{output_schema}"
+                    "Current page text:\n"
+                    f"{text[:SUMMARY_CONTEXT_LIMIT]}\n\n"
+                    "Previous page summaries for continuity:\n"
+                    f"{previous_block}\n\n"
+                    "Known character anchors:\n"
+                    f"{character_block}\n\n"
+                    "Instructions:\n"
+                    "- Capture what is visually unique about this page.\n"
+                    "- Keep character appearance consistent with known anchors.\n"
+                    "- Make continuity_anchor a short note about what should stay stable from previous pages.\n"
+                    "- Make scene_change explain what visually changes on this page versus earlier context.\n"
+                    "- condensed_summary should be 2 to 3 sentences and image-friendly.\n\n"
+                    f"Output format (exact keys): {output_schema}"
                 ),
             },
         ],
@@ -271,15 +371,210 @@ def _summarize_with_ollama(text: str) -> dict:
     }
 
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
+        response = requests.post(ollama_url, json=payload, timeout=ollama_timeout)
         response.raise_for_status()
         content = _extract_chat_content(response.json())
-        details = _extract_scene_details(content)
-        if details:
-            return details
+        parsed = _parse_json_maybe(content)
+        if isinstance(parsed, dict) and parsed:
+            return parsed
     except (requests.RequestException, ValueError, KeyError) as exc:
-        logger.debug("Ollama summarization failed, using fallback: %s", exc)
+        logger.debug("Ollama page summarization failed, using fallback: %s", exc)
     return {}
+
+
+def _compose_visual_prompt(
+    page_summary: dict,
+    continuity_context: dict,
+    characters: list[dict],
+    style_preset: str,
+) -> tuple[str, str]:
+    prompt = _prompt_with_ollama(page_summary, continuity_context, characters, style_preset)
+    if prompt:
+        return _guard_prompt(prompt), STYLE_PRESETS.get(style_preset, STYLE_PRESETS[DEFAULT_STYLE_PRESET])["negative"]
+
+    return _fallback_visual_prompt(page_summary, continuity_context, characters, style_preset)
+
+
+def _prompt_with_ollama(
+    page_summary: dict,
+    continuity_context: dict,
+    characters: list[dict],
+    style_preset: str,
+) -> str:
+    ollama_url = os.getenv("BOOKTURES_OLLAMA_URL", "http://127.0.0.1:11434/v1/chat/completions")
+    ollama_model = os.getenv("BOOKTURES_OLLAMA_MODEL", "granite3.2:8b")
+    ollama_timeout = int(os.getenv("BOOKTURES_OLLAMA_TIMEOUT", "45"))
+    preset = STYLE_PRESETS.get(style_preset, STYLE_PRESETS[DEFAULT_STYLE_PRESET])
+    previous_block = "\n".join(
+        f"- page {item['page_number']}: {item['summary']}"
+        for item in continuity_context.get("previous_summaries", [])
+    ) or "- no prior pages"
+    character_block = "\n".join(
+        f"- {character['name']}: {_normalize_inline_text(character.get('visual_profile', '')) or 'preserve established appearance'}"
+        for character in characters[:MAX_CHARACTERS_PER_PAGE]
+        if character.get("name")
+    ) or "- no reliable named characters"
+
+    output_schema = '{"visual_prompt":"..."}'
+    payload = {
+        "model": ollama_model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You write one image-generation prompt for a single book page. "
+                    "Return valid JSON only with key visual_prompt. "
+                    "The prompt must prioritize the current page's distinctive scene while keeping characters consistent with previous pages."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Style direction: {preset['style']}\n\n"
+                    f"Current page full summary: {page_summary.get('full_summary', '')}\n\n"
+                    f"Current page condensed visual summary: {page_summary.get('condensed_summary', '')}\n\n"
+                    "Current page beats:\n"
+                    + "\n".join(f"- {beat}" for beat in page_summary.get("page_beats", []))
+                    + "\n\n"
+                    + "Key objects:\n"
+                    + ("\n".join(f"- {item}" for item in page_summary.get("key_objects", [])) or "- none")
+                    + "\n\n"
+                    + "Character focus on this page:\n"
+                    + ("\n".join(f"- {item}" for item in page_summary.get("character_focus", [])) or "- none")
+                    + "\n\n"
+                    + "Previous page continuity context:\n"
+                    + previous_block
+                    + "\n\n"
+                    + "Character appearance anchors:\n"
+                    + character_block
+                    + "\n\n"
+                    + "Required prompt sections:\n"
+                    + f"- page beat: summarize this page visually in one vivid sentence\n"
+                    + f"- continuity anchor: {page_summary.get('continuity_anchor', '') or 'preserve established character identity'}\n"
+                    + f"- scene change: {page_summary.get('scene_change', '') or 'show what is visually new on this page'}\n"
+                    + f"- setting: {page_summary.get('setting', '')}\n"
+                    + f"- location: {page_summary.get('location', '')}\n"
+                    + f"- lighting: {page_summary.get('lighting', '')}\n"
+                    + f"- mood: {page_summary.get('mood', '')}\n"
+                    + f"- camera focus: {page_summary.get('camera_focus', '')}\n"
+                    + "\nConstraints:\n"
+                    + "- Keep it specific to the current page, not generic.\n"
+                    + "- Mention named characters only if they are present.\n"
+                    + "- Preserve face, hair, clothing, and silhouette continuity when characters reappear.\n"
+                    + "- Prefer concrete props, gestures, staging, and environment changes over boilerplate style words.\n"
+                    + "- Keep it under 170 words.\n\n"
+                    + f"Output format (exact keys): {output_schema}"
+                ),
+            },
+        ],
+        "temperature": 0.35,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        response = requests.post(ollama_url, json=payload, timeout=ollama_timeout)
+        response.raise_for_status()
+        content = _extract_chat_content(response.json())
+        parsed = _parse_json_maybe(content)
+        if isinstance(parsed, dict):
+            visual_prompt = _normalize_inline_text(parsed.get("visual_prompt", ""))
+            if visual_prompt:
+                return visual_prompt
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        logger.debug("Ollama prompt composition failed, using fallback: %s", exc)
+    return ""
+
+
+def _fallback_page_summary(
+    cleaned: str,
+    page_number: int,
+    continuity_context: dict,
+    characters: list[dict],
+) -> dict:
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
+    summary_sentences = _clean_sentence_candidates(sentences, max_items=6)
+    condensed_sentences = _clean_sentence_candidates(sentences, max_items=3)
+    page_beats = _clean_sentence_candidates(sentences, max_items=MAX_PAGE_BEATS)
+    continuity_anchor = continuity_context.get("previous_summary_text", "")
+    if not continuity_anchor and characters:
+        continuity_anchor = "; ".join(
+            f"{character['name']} stays visually consistent"
+            for character in characters[:MAX_CHARACTERS_PER_PAGE]
+            if character.get("name")
+        )
+    if not continuity_anchor:
+        continuity_anchor = "establish the opening visual identity of the story world"
+
+    return {
+        "page_kind": "story",
+        "full_summary": " ".join(summary_sentences).strip() or cleaned[:SUMMARY_CONTEXT_LIMIT],
+        "condensed_summary": _fallback_visual_scene_summary(cleaned, characters),
+        "page_beats": page_beats or [_fallback_visual_scene_summary(cleaned, characters)],
+        "key_objects": _extract_key_objects(cleaned),
+        "setting": _infer_setting(cleaned),
+        "location": _infer_location(cleaned),
+        "time_of_day": _infer_time_of_day(cleaned),
+        "lighting": _infer_lighting(cleaned),
+        "weather": _infer_weather(cleaned),
+        "mood": _infer_mood(cleaned),
+        "camera_focus": _shot_variation_directive(page_number),
+        "character_focus": _build_character_focus_fallback(cleaned, characters),
+        "continuity_anchor": continuity_anchor,
+        "scene_change": _infer_scene_change(cleaned),
+    }
+
+
+def _fallback_visual_prompt(
+    page_summary: dict,
+    continuity_context: dict,
+    characters: list[dict],
+    style_preset: str,
+) -> tuple[str, str]:
+    preset = STYLE_PRESETS.get(style_preset, STYLE_PRESETS[DEFAULT_STYLE_PRESET])
+    sections = [
+        preset["style"],
+        f"page beat: {page_summary.get('condensed_summary', '')}",
+        f"{PROMPT_PIPELINE_MARKER} {page_summary.get('continuity_anchor', '') or continuity_context.get('character_anchor', 'preserve established visual identity')}",
+    ]
+    if page_summary.get("scene_change"):
+        sections.append(f"scene change: {page_summary['scene_change']}")
+    if page_summary.get("setting"):
+        sections.append(f"setting: {page_summary['setting']}")
+    if page_summary.get("location"):
+        sections.append(f"location: {page_summary['location']}")
+    if page_summary.get("time_of_day"):
+        sections.append(f"time of day: {page_summary['time_of_day']}")
+    if page_summary.get("lighting"):
+        sections.append(f"lighting: {page_summary['lighting']}")
+    if page_summary.get("weather") and page_summary.get("weather") != "unspecified":
+        sections.append(f"weather: {page_summary['weather']}")
+    if page_summary.get("mood"):
+        sections.append(f"mood: {page_summary['mood']}")
+    if page_summary.get("camera_focus"):
+        sections.append(f"camera focus: {page_summary['camera_focus']}")
+    if page_summary.get("page_beats"):
+        sections.append("page actions: " + "; ".join(page_summary["page_beats"][:3]))
+    if page_summary.get("key_objects"):
+        sections.append("key objects: " + "; ".join(page_summary["key_objects"][:4]))
+    if characters:
+        character_bits = []
+        for character in characters[:MAX_CHARACTERS_PER_PAGE]:
+            name = _normalize_inline_text(character.get("name", ""))
+            if not name:
+                continue
+            profile = _normalize_inline_text(character.get("visual_profile", ""))
+            if profile:
+                character_bits.append(f"{name} ({profile})")
+            else:
+                character_bits.append(name)
+        if character_bits:
+            sections.append("characters present: " + "; ".join(character_bits))
+            sections.append("preserve face, hair, outfit, and silhouette continuity for returning characters")
+    elif page_summary.get("character_focus"):
+        sections.append("character acting: " + "; ".join(page_summary["character_focus"][:3]))
+
+    prompt = ". ".join(section for section in sections if section).strip()
+    return _guard_prompt(prompt), preset["negative"]
 
 
 def _extract_chat_content(data: dict) -> str:
@@ -297,88 +592,6 @@ def _extract_chat_content(data: dict) -> str:
     return ""
 
 
-def _extract_scene_details(content: str) -> dict:
-    if not content:
-        return {}
-    parsed = _parse_json_maybe(content)
-    if not isinstance(parsed, dict):
-        return {}
-    narrative_summary = parsed.get("narrative_summary") or parsed.get("summary") or parsed.get("scene_summary") or ""
-    visual_description = parsed.get("visual_description") or ""
-    summary = " ".join(part for part in [narrative_summary, visual_description] if part).strip()
-
-    color_palette = parsed.get("color_palette") if isinstance(parsed.get("color_palette"), dict) else {}
-    primary_colors = color_palette.get("primary_colors") if isinstance(color_palette.get("primary_colors"), list) else []
-    accent_colors = color_palette.get("accent_colors") if isinstance(color_palette.get("accent_colors"), list) else []
-    mood_colors = color_palette.get("mood_colors") or ""
-    color_parts = []
-    if primary_colors:
-        color_parts.append("primary: " + ", ".join(str(c) for c in primary_colors[:4]))
-    if accent_colors:
-        color_parts.append("accent: " + ", ".join(str(c) for c in accent_colors[:3]))
-    if mood_colors:
-        color_parts.append(str(mood_colors))
-    color_palette_text = "; ".join(color_parts)
-
-    actions = parsed.get("actions_in_frame") or parsed.get("actions") or parsed.get("key_actions") or []
-    objects = parsed.get("foreground_elements") or []
-    if isinstance(parsed.get("midground_elements"), list):
-        objects = list(objects) + list(parsed.get("midground_elements"))
-    if isinstance(parsed.get("background_elements"), list):
-        objects = list(objects) + list(parsed.get("background_elements"))
-    if not objects:
-        objects = parsed.get("objects") or parsed.get("important_objects") or []
-
-    tone = parsed.get("emotional_tone") or parsed.get("tone") or ""
-    setting = parsed.get("setting") or ""
-    if parsed.get("composition"):
-        setting = f"{setting}. composition: {parsed.get('composition')}".strip(". ")
-
-    background_details = parsed.get("background_elements") or parsed.get("background_details") or parsed.get("background") or []
-    if isinstance(background_details, list):
-        background_details = "; ".join(str(x) for x in background_details[:5])
-
-    character_blocking = parsed.get("character_positioning") or parsed.get("character_blocking") or parsed.get("blocking") or ""
-
-    character_descriptions = parsed.get("character_descriptions") if isinstance(parsed.get("character_descriptions"), list) else []
-    character_notes = []
-    for item in character_descriptions[:4]:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name") or "").strip()
-        appearance = str(item.get("appearance") or "").strip()
-        pose = str(item.get("pose_and_expression") or "").strip()
-        if not any([name, appearance, pose]):
-            continue
-        parts = []
-        if name:
-            parts.append(name)
-        if appearance:
-            parts.append(f"appearance: {appearance}")
-        if pose:
-            parts.append(f"pose: {pose}")
-        character_notes.append(", ".join(parts))
-
-    return {
-        "summary": summary,
-        "setting": setting,
-        "actions": actions,
-        "objects": objects,
-        "tone": tone,
-        "location": parsed.get("setting") or parsed.get("location") or parsed.get("place") or "",
-        "time_of_day": parsed.get("time_of_day") or parsed.get("time") or "",
-        "lighting": parsed.get("lighting_style") or parsed.get("lighting") or "",
-        "weather": parsed.get("weather_conditions") or parsed.get("weather") or "",
-        "camera_framing": parsed.get("camera_framing") or parsed.get("framing") or "",
-        "background_details": background_details,
-        "character_blocking": character_blocking,
-        "color_palette": color_palette_text,
-        "art_style_reference": parsed.get("art_style_reference") or "",
-        "consistency_notes": parsed.get("consistency_notes") or "",
-        "character_notes": character_notes,
-    }
-
-
 def _parse_json_maybe(content: str):
     try:
         return json.loads(content)
@@ -394,135 +607,13 @@ def _parse_json_maybe(content: str):
         return {}
 
 
-def _fallback_summary(cleaned: str) -> str:
-    snippets = re.split(r"(?<=[.!?])\s+", cleaned)
-    return _limit_to_n_sentences(" ".join(snippets[:MAX_SCENE_SUMMARY_SENTENCES]).strip())
-
-
-def _limit_to_n_sentences(text: str, max_sentences: int = MAX_SCENE_SUMMARY_SENTENCES) -> str:
-    if not text:
-        return ""
-    chunks = re.split(r"(?<=[.!?])\s+", text.strip())
-    if not chunks:
-        return text.strip()
-    selected = [chunk.strip() for chunk in chunks[:max_sentences] if chunk.strip()]
-    return " ".join(selected).strip()
-
-
-def _compose_visual_prompt(
-    scene_details: dict,
-    characters: list[dict],
-    style_preset: str,
-) -> tuple[str, str]:
-    preset = STYLE_PRESETS.get(style_preset, STYLE_PRESETS[DEFAULT_STYLE_PRESET])
-    scene_summary = scene_details.get("summary", "")
-    scene_prompt_text = _scene_for_prompt(scene_summary)
-    setting = scene_details.get("setting", "")
-    actions = scene_details.get("actions", [])
-    objects = scene_details.get("objects", [])
-    tone = scene_details.get("tone", "")
-    location = scene_details.get("location", "")
-    time_of_day = scene_details.get("time_of_day", "")
-    lighting = scene_details.get("lighting", "")
-    weather = scene_details.get("weather", "")
-    camera_framing = scene_details.get("camera_framing", "")
-    background_details = scene_details.get("background_details", "")
-    character_blocking = scene_details.get("character_blocking", "")
-    color_palette = scene_details.get("color_palette", "")
-    art_style_reference = scene_details.get("art_style_reference", "")
-    consistency_notes = scene_details.get("consistency_notes", "")
-    character_notes = scene_details.get("character_notes", [])
-    shot_variation = scene_details.get("shot_variation", "")
-    visual_hook = _build_visual_hook(actions, objects, tone)
-
-    sections = []
-    sections.append(("style", preset["style"]))
-    if scene_prompt_text:
-        sections.append(("scene", f"scene: {scene_prompt_text}"))
-    if visual_hook:
-        sections.append(("visual_hook", f"distinct visual focus: {visual_hook}"))
-    if shot_variation:
-        sections.append(("shot_variation", f"shot directive: {shot_variation}"))
-    if setting:
-        sections.append(("setting", f"setting: {setting}"))
-    if actions:
-        sections.append(("actions", "actions: " + "; ".join(actions)))
-    if objects:
-        sections.append(("objects", "important objects: " + "; ".join(objects)))
-    if tone:
-        sections.append(("tone", f"tone: {tone}"))
-    if location:
-        sections.append(("location", f"location: {location}"))
-    if time_of_day:
-        sections.append(("time_of_day", f"time of day: {time_of_day}"))
-    if lighting:
-        sections.append(("lighting", f"lighting: {lighting}"))
-    if weather:
-        sections.append(("weather", f"weather: {weather}"))
-    if camera_framing:
-        sections.append(("camera_framing", f"camera framing: {camera_framing}"))
-    if background_details:
-        sections.append(("background_details", f"background details: {background_details}"))
-    if character_blocking:
-        sections.append(("character_blocking", f"character blocking: {character_blocking}"))
-    if color_palette:
-        sections.append(("color_palette", f"color palette: {color_palette}"))
-    if art_style_reference:
-        sections.append(("art_style_reference", f"art style: {art_style_reference}"))
-    if character_notes:
-        sections.append(("character_notes", "character scene notes: " + "; ".join(character_notes)))
-    if consistency_notes:
-        sections.append(("consistency_notes", f"continuity: {consistency_notes}"))
-
-    if characters:
-        character_descriptions = []
-        for character in characters:
-            descriptor = character["name"]
-            profile = (character.get("visual_profile") or "").strip()
-            if profile:
-                traits = [trait.strip() for trait in profile.split(",") if trait.strip()][:3]
-                if traits:
-                    descriptor = f"{descriptor} ({', '.join(traits)})"
-            character_descriptions.append(descriptor)
-        sections.append(("characters", "characters: " + "; ".join(character_descriptions)))
-        sections.append(("consistency", "preserve identity, face structure, hair, and outfit consistency"))
-    else:
-        sections.append(("no_characters", "focus on environment, mood, and narrative action"))
-
-    prompt = _assemble_clip_friendly_prompt(sections)
-    prompt = _guard_prompt(prompt)
-    return prompt[:MAX_PROMPT_CHARS], preset["negative"]
-
-
-def _fallback_scene_details(cleaned: str) -> dict:
-    snippets = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
-    summary = _fallback_summary(cleaned)
-    setting = snippets[0] if snippets else ""
-    actions = snippets[1:1 + MAX_SCENE_ACTIONS]
-    return {
-        "summary": summary,
-        "setting": setting[:180],
-        "actions": actions,
-        "objects": [],
-        "tone": "",
-        "location": "interior",
-        "time_of_day": _infer_time_of_day(cleaned),
-        "lighting": _infer_lighting(cleaned),
-        "weather": _infer_weather(cleaned),
-        "camera_framing": "medium shot",
-        "background_details": "period room details and lived-in objects",
-        "character_blocking": "main characters facing each other with clear emotional distance",
-    }
-
-
-def _normalize_summary(text: str) -> str:
+def _normalize_summary(text: str, max_sentences: int = 4) -> str:
     text = _normalize_inline_text(text)
-    return _limit_to_n_sentences(text, MAX_SCENE_SUMMARY_SENTENCES)
+    return _limit_to_n_sentences(text, max_sentences=max_sentences)
 
 
 def _normalize_inline_text(text: str) -> str:
-    cleaned = re.sub(r"\s+", " ", str(text or "").strip())
-    return cleaned
+    return re.sub(r"\s+", " ", str(text or "").strip())
 
 
 def _normalize_list(items, max_items: int) -> list[str]:
@@ -530,7 +621,7 @@ def _normalize_list(items, max_items: int) -> list[str]:
         return []
     cleaned_items = []
     for item in items:
-        value = _normalize_inline_text(str(item))
+        value = _normalize_inline_text(item)
         if not value:
             continue
         cleaned_items.append(value)
@@ -539,22 +630,195 @@ def _normalize_list(items, max_items: int) -> list[str]:
     return cleaned_items
 
 
-def _ensure_environment_details(details: dict, text: str) -> dict:
+def _limit_to_n_sentences(text: str, max_sentences: int = 4) -> str:
+    if not text:
+        return ""
+    chunks = re.split(r"(?<=[.!?])\s+", text.strip())
+    selected = [chunk.strip() for chunk in chunks[:max_sentences] if chunk.strip()]
+    return " ".join(selected).strip()
+
+
+def _ensure_page_summary_defaults(
+    details: dict,
+    text: str,
+    page_number: int,
+    continuity_context: dict,
+    characters: list[dict],
+) -> dict:
+    if not details.get("page_kind"):
+        details["page_kind"] = _classify_page_kind(text, page_number)
+    if not details.get("full_summary"):
+        details["full_summary"] = _fallback_condensed_summary(text)
+    if not details.get("condensed_summary"):
+        details["condensed_summary"] = _fallback_visual_scene_summary(text, characters)
+    if not details.get("page_beats"):
+        details["page_beats"] = [details["condensed_summary"]]
+    if not details.get("key_objects"):
+        details["key_objects"] = _extract_key_objects(text)
     if not details.get("location"):
-        details["location"] = "interior" if _has_any(text, ["room", "house", "chamber", "window", "door"]) else "outdoor setting"
+        details["location"] = _infer_location(text)
     if not details.get("time_of_day"):
         details["time_of_day"] = _infer_time_of_day(text)
     if not details.get("lighting"):
         details["lighting"] = _infer_lighting(text)
     if not details.get("weather"):
         details["weather"] = _infer_weather(text)
-    if not details.get("camera_framing"):
-        details["camera_framing"] = "medium shot"
-    if not details.get("background_details"):
-        details["background_details"] = "period-appropriate setting details relevant to the scene"
-    if not details.get("character_blocking"):
-        details["character_blocking"] = "characters arranged to emphasize current emotional tension"
+    if not details.get("mood"):
+        details["mood"] = _infer_mood(text)
+    if not details.get("camera_focus"):
+        details["camera_focus"] = _shot_variation_directive(page_number)
+    if not details.get("continuity_anchor"):
+        details["continuity_anchor"] = (
+            continuity_context.get("previous_summary_text")
+            or continuity_context.get("character_anchor")
+            or "preserve the established visual identity for recurring characters and locations"
+        )
+    if not details.get("scene_change"):
+        details["scene_change"] = _infer_scene_change(text)
+    if not details.get("character_focus"):
+        details["character_focus"] = _build_character_focus_fallback(text, characters)
     return details
+
+
+def _fallback_condensed_summary(text: str) -> str:
+    cleaned = _normalize_inline_text(text)
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
+    return " ".join(sentences[:3]).strip() or cleaned[:500]
+
+
+def _classify_page_kind(text: str, page_number: int) -> str:
+    cleaned = _normalize_inline_text(text)
+    lower = cleaned.lower()
+    if not cleaned:
+        return "blank"
+    if page_number <= 3 and ("table of contents" in lower or "contents" in lower):
+        return "contents"
+    if "without any warranty" in lower or "merchantablity" in lower or "sherlock-holm.es" in lower:
+        return "legal"
+    if page_number <= 2 and len(cleaned.split()) <= 12:
+        return "title"
+    if cleaned.count(". . .") >= 3 or re.search(r"\btable of contents\b", lower):
+        return "contents"
+    return "story"
+
+
+def _summarize_non_story_page(text: str, page_number: int, page_kind: str, continuity_context: dict) -> dict:
+    if page_kind == "title":
+        condensed = "A title page presenting the book name and author in a centered typographic layout."
+        setting = "book title page"
+        scene_change = "the book opens with formal title typography instead of a narrative scene"
+    elif page_kind == "legal":
+        condensed = "A legal or disclaimer page composed of dense blocks of publication text."
+        setting = "publishing front matter"
+        scene_change = "the page is informational front matter rather than story action"
+    elif page_kind == "contents":
+        condensed = "A table of contents page listing chapters and sections in a structured typographic layout."
+        setting = "table of contents page"
+        scene_change = "the page presents chapter listings instead of a story moment"
+    else:
+        condensed = "A blank or nearly blank page with minimal visible content."
+        setting = "blank page"
+        scene_change = "there is no narrative scene on this page"
+
+    return {
+        "page_kind": page_kind,
+        "full_summary": condensed,
+        "condensed_summary": condensed,
+        "page_beats": [condensed],
+        "key_objects": ["printed text", "page layout"] if page_kind != "blank" else [],
+        "setting": setting,
+        "location": "printed book page",
+        "time_of_day": "",
+        "lighting": "even page lighting",
+        "weather": "",
+        "mood": "quiet editorial page",
+        "camera_focus": "straight-on view of the printed page layout",
+        "character_focus": [],
+        "continuity_anchor": continuity_context.get("previous_summary_text", "") or "preserve book design continuity across front matter pages",
+        "scene_change": scene_change,
+    }
+
+
+def _clean_sentence_candidates(sentences: list[str], max_items: int) -> list[str]:
+    cleaned_items: list[str] = []
+    for sentence in sentences:
+        candidate = _normalize_inline_text(sentence)
+        if not candidate:
+            continue
+        if len(candidate.split()) < 6:
+            continue
+        if candidate.count(".") > 6:
+            continue
+        cleaned_items.append(candidate)
+        if len(cleaned_items) >= max_items:
+            break
+    return cleaned_items
+
+
+def _fallback_visual_scene_summary(text: str, characters: list[dict]) -> str:
+    setting = _infer_setting(text)
+    mood = _infer_mood(text)
+    location = _infer_location(text)
+    char_names = [
+        _normalize_inline_text(character.get("name", ""))
+        for character in characters[:2]
+        if _normalize_inline_text(character.get("name", ""))
+    ]
+    subject = ", ".join(char_names) if char_names else "the central figures"
+    key_objects = _extract_key_objects(text)
+    prop_text = f" with {', '.join(key_objects[:2])}" if key_objects else ""
+    return f"{subject} in {location}, {setting}, rendered with {mood}{prop_text}."
+
+
+def _infer_setting(text: str) -> str:
+    lower = text.lower()
+    if _has_any(lower, ["moor", "field", "tor", "road", "garden", "lane", "path"]):
+        return "an exposed outdoor environment"
+    if _has_any(lower, ["hall", "study", "room", "house", "fireplace", "window", "table"]):
+        return "an interior story setting"
+    if _has_any(lower, ["carriage", "cab", "street", "london"]):
+        return "a city travel scene"
+    return "a narrative story setting"
+
+
+def _extract_key_objects(text: str) -> list[str]:
+    lowered = text.lower()
+    keywords = [
+        "letter", "book", "lamp", "window", "door", "table", "fire", "candle",
+        "carriage", "horse", "gun", "knife", "portrait", "mirror", "ring", "chair",
+        "stairs", "garden", "rain", "clock", "bag", "paper", "teacup", "bed",
+    ]
+    found = []
+    for keyword in keywords:
+        if keyword in lowered:
+            found.append(keyword)
+        if len(found) >= MAX_KEY_OBJECTS:
+            break
+    return found
+
+
+def _build_character_focus_fallback(text: str, characters: list[dict]) -> list[str]:
+    focus = []
+    for character in characters[:MAX_CHARACTERS_PER_PAGE]:
+        name = _normalize_inline_text(character.get("name", ""))
+        if not name:
+            continue
+        focus.append(f"{name} is central to the page action")
+    if focus:
+        return focus[:MAX_CHARACTER_MOMENTS]
+    cleaned = _normalize_inline_text(text)
+    if cleaned:
+        return [cleaned[:160]]
+    return []
+
+
+def _infer_location(text: str) -> str:
+    lower = text.lower()
+    if _has_any(lower, ["street", "road", "field", "garden", "moor", "forest", "river"]):
+        return "outdoor setting"
+    if _has_any(lower, ["room", "house", "hall", "study", "bedroom", "window", "door"]):
+        return "interior"
+    return "unspecified setting"
 
 
 def _infer_time_of_day(text: str) -> str:
@@ -582,10 +846,47 @@ def _infer_weather(text: str) -> str:
     if _has_any(lower, ["rain", "storm", "thunder"]):
         return "rainy"
     if _has_any(lower, ["snow", "winter"]):
-        return "cold/snowy"
+        return "cold or snowy"
     if _has_any(lower, ["wind", "gust"]):
         return "windy"
     return "unspecified"
+
+
+def _infer_mood(text: str) -> str:
+    lower = text.lower()
+    if _has_any(lower, ["fear", "terror", "panic", "dread"]):
+        return "tense and fearful"
+    if _has_any(lower, ["joy", "smile", "laugh", "warm"]):
+        return "warm and hopeful"
+    if _has_any(lower, ["anger", "furious", "rage"]):
+        return "heated confrontation"
+    if _has_any(lower, ["mystery", "strange", "curious", "secret"]):
+        return "mysterious and suspenseful"
+    return "dramatic narrative tension"
+
+
+def _infer_scene_change(text: str) -> str:
+    lower = text.lower()
+    if _has_any(lower, ["suddenly", "at once", "immediately", "burst"]):
+        return "a sudden change interrupts the prior rhythm"
+    if _has_any(lower, ["entered", "arrived", "came in", "appeared"]):
+        return "a new presence changes the staging of the scene"
+    if _has_any(lower, ["looked", "watched", "stared", "glanced"]):
+        return "the focus shifts to observation and reaction"
+    return "the page should clearly show the next visual beat in the story"
+
+
+def _shot_variation_directive(page_number: int) -> str:
+    variants = [
+        "wide establishing composition with layered depth",
+        "medium shot centered on character interaction",
+        "close emotional framing on faces and gesture",
+        "over-shoulder viewpoint that emphasizes tension",
+        "low-angle composition with dramatic silhouettes",
+        "high-angle framing that clarifies spatial relationships",
+    ]
+    index = max(0, (int(page_number) - 1) % len(variants))
+    return variants[index]
 
 
 def _has_any(text: str, keywords: list[str]) -> bool:
@@ -600,81 +901,5 @@ def _guard_prompt(prompt: str) -> str:
     return " ".join(words[:MAX_PROMPT_WORDS])
 
 
-def _assemble_clip_friendly_prompt(sections: list[tuple[str, str]]) -> str:
-    if not sections:
-        return ""
-
-    # High-priority sections kept first so truncation, if any, happens on low-impact context.
-    priority = {
-        "style": 0,
-        "scene": 1,
-        "characters": 2,
-        "consistency": 3,
-        "visual_hook": 4,
-        "actions": 5,
-        "shot_variation": 6,
-        "setting": 7,
-        "tone": 8,
-        "location": 7,
-        "lighting": 9,
-        "camera_framing": 10,
-        "character_blocking": 11,
-        "time_of_day": 12,
-        "objects": 13,
-        "background_details": 14,
-        "weather": 15,
-        "no_characters": 16,
-        "color_palette": 17,
-        "art_style_reference": 18,
-        "character_notes": 19,
-        "consistency_notes": 20,
-    }
-    ordered = sorted(sections, key=lambda item: priority.get(item[0], 100))
-    pieces = []
-    for _, content in ordered:
-        candidate = ". ".join(pieces + [content]).strip()
-        if len(candidate.split()) > MAX_CLIP_WORDS:
-            continue
-        pieces.append(content)
-
-    if not pieces:
-        # Guaranteed minimal fallback.
-        return ordered[0][1]
-    return ". ".join(pieces).strip()
-
-
-def _scene_for_prompt(scene_summary: str) -> str:
-    text = _normalize_inline_text(scene_summary)
-    if not text:
-        return ""
-    first_sentences = _limit_to_n_sentences(text, max_sentences=2)
-    words = first_sentences.split()
-    if len(words) <= MAX_PROMPT_SCENE_WORDS:
-        return first_sentences
-    return " ".join(words[:MAX_PROMPT_SCENE_WORDS]).strip()
-
-
-def _build_visual_hook(actions: list[str], objects: list[str], tone: str) -> str:
-    hooks = []
-    if actions:
-        hooks.append(actions[0])
-    if len(actions) > 1:
-        hooks.append(actions[1])
-    if objects:
-        hooks.append(f"key prop: {objects[0]}")
-    if tone:
-        hooks.append(f"mood: {tone}")
-    return "; ".join(hooks[:3]).strip()
-
-
-def _shot_variation_directive(page_number: int) -> str:
-    variants = [
-        "wide establishing composition with layered depth",
-        "medium shot with clear character interaction focus",
-        "close-up emotional emphasis on faces and gesture",
-        "over-shoulder perspective highlighting tension",
-        "low-angle dramatic framing with strong silhouettes",
-        "high-angle framing showing spatial relationships",
-    ]
-    index = max(0, (int(page_number) - 1) % len(variants))
-    return variants[index]
+def _prompt_matches_current_pipeline(prompt: str) -> bool:
+    return PROMPT_PIPELINE_MARKER in (prompt or "").lower()

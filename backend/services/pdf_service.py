@@ -4,6 +4,7 @@ import pdfplumber
 from collections import Counter
 import logging
 import re
+from typing import Any
 
 PDF_STORAGE_PATH = "storage/pdfs"
 logger = logging.getLogger(__name__)
@@ -24,6 +25,15 @@ OCR_MIN_LENGTH_THRESHOLD = 160
 OCR_MIN_TOKEN_THRESHOLD = 30
 OCR_RENDER_RESOLUTION = 300
 OCR_TESSERACT_CONFIG = "--oem 3 --psm 6"
+LIGATURE_REPLACEMENTS = {
+    "\ufb00": "ff",
+    "\ufb01": "fi",
+    "\ufb02": "fl",
+    "\ufb03": "ffi",
+    "\ufb04": "ffl",
+    "\ufb05": "ft",
+    "\ufb06": "st",
+}
 
 def save_pdf(file_bytes: bytes, filename: str) -> str:
     os.makedirs(PDF_STORAGE_PATH, exist_ok=True)
@@ -41,10 +51,20 @@ def extract_text_by_page(pdf_path: str):
     pages = []
     header_counts = Counter()
     footer_counts = Counter()
+    pypdf_pages: list[Any] = []
+
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        reader = PdfReader(pdf_path)
+        pypdf_pages = list(reader.pages)
+    except Exception as exc:
+        logger.debug("pypdf unavailable for %s: %s", pdf_path, exc)
 
     with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages):
-            raw_text = _extract_page_text(page)
+            pypdf_page = pypdf_pages[i] if i < len(pypdf_pages) else None
+            raw_text = _extract_page_text(page, pypdf_page=pypdf_page)
             lines = _split_lines(raw_text)
 
             if lines:
@@ -92,22 +112,47 @@ def extract_text_by_page(pdf_path: str):
     return cleaned_pages
 
 
-def _extract_page_text(page):
-    # Try to preserve layout and spacing by using the layout-aware extractor first.
-    text = page.extract_text(layout=True, x_tolerance=1, y_tolerance=1)
-    if not text:
-        text = page.extract_text(x_tolerance=1, y_tolerance=1)
+def _extract_page_text(page, pypdf_page=None):
+    candidates: list[str] = []
 
-    if not text:
+    plumber_layout = page.extract_text(layout=True, x_tolerance=1, y_tolerance=1)
+    if plumber_layout:
+        candidates.append(plumber_layout)
+
+    plumber_plain = page.extract_text(x_tolerance=1, y_tolerance=1)
+    if plumber_plain:
+        candidates.append(plumber_plain)
+
+    if pypdf_page is not None:
+        try:
+            pypdf_text = pypdf_page.extract_text() or ""
+            if pypdf_text:
+                candidates.append(pypdf_text)
+        except Exception as exc:
+            logger.debug("pypdf extraction failed for page: %s", exc)
+
+    if not candidates:
         words = page.extract_words(use_text_flow=True)
-        text = " ".join(word["text"] for word in words)
+        candidates.append(" ".join(word["text"] for word in words))
 
-    text = text or ""
+    text = _pick_best_text_candidate(candidates)
     if _should_try_ocr(text):
         ocr_text = _extract_page_text_with_ocr(page)
         if _extraction_score(ocr_text) > _extraction_score(text):
             return ocr_text
     return text
+
+
+def _pick_best_text_candidate(candidates: list[str]) -> str:
+    best_text = ""
+    best_score = float("-inf")
+    for candidate in candidates:
+        normalized = _normalize_text(candidate or "")
+        score = _extraction_score(normalized)
+        if score > best_score:
+            best_score = score
+            best_text = normalized
+    return best_text
 
 
 def _extract_page_text_with_ocr(page) -> str:
@@ -157,12 +202,18 @@ def _extraction_score(text: str) -> float:
     words = re.findall(r"[A-Za-z]{2,}", normalized)
     bad_chars = len(re.findall(r"[^A-Za-z0-9\s.,;:!?'\-\"()\[\]]", normalized))
     bad_ratio = bad_chars / max(len(normalized), 1)
+    single_letter_ratio = sum(1 for token in tokens if len(token) == 1 and token.isalpha()) / max(len(tokens), 1)
+    weird_spacing_penalty = len(re.findall(r"\b[A-Za-z]\s+[A-Za-z]\b", normalized))
+    broken_hyphen_penalty = len(re.findall(r"\w+-\s+\w", normalized))
 
     return (
         len(words) * 1.0
         + alpha_tokens * 0.5
         + min(len(normalized), 3000) * 0.02
         - bad_ratio * 50
+        - single_letter_ratio * 80
+        - weird_spacing_penalty * 0.8
+        - broken_hyphen_penalty * 0.5
     )
 
 
@@ -271,7 +322,10 @@ def _normalize_text(text: str) -> str:
         return ""
 
     cleaned = text.strip()
+    for source, target in LIGATURE_REPLACEMENTS.items():
+        cleaned = cleaned.replace(source, target)
     cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"(?<=\w)-\s+(?=\w)", "", cleaned)
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
     cleaned = re.sub(r"([(\[{])\s+", r"\1", cleaned)
     cleaned = re.sub(r"\s+([)\]}])", r"\1", cleaned)

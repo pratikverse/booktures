@@ -96,11 +96,13 @@ def _score_prompt_quality(prompt: str) -> float:
     words = text.split()
     if len(words) < 15:
         return 0.35
-    if len(words) > 160:
+    if len(words) > 220:
         return 0.55
-    has_scene = 1.0 if "scene:" in text.lower() else 0.65
-    has_character = 1.0 if "characters:" in text.lower() else 0.7
-    return min(1.0, 0.45 + (0.25 * has_scene) + (0.3 * has_character))
+    lower = text.lower()
+    has_page_beat = 1.0 if "page beat:" in lower else 0.7
+    has_continuity = 1.0 if "continuity anchor:" in lower else 0.65
+    has_character = 1.0 if ("characters present:" in lower or "character acting:" in lower) else 0.7
+    return min(1.0, 0.35 + (0.25 * has_page_beat) + (0.2 * has_continuity) + (0.2 * has_character))
 
 
 def _score_character_consistency(characters: list[dict]) -> float:

@@ -47,6 +47,16 @@ def ensure_sqlite_schema():
         ).fetchall()
         tables = {row[0] for row in table_rows}
 
+        if "books" in tables:
+            column_rows = conn.exec_driver_sql("PRAGMA table_info(books)").fetchall()
+            columns = {row[1] for row in column_rows}
+            if "created_at" not in columns:
+                conn.exec_driver_sql("ALTER TABLE books ADD COLUMN created_at DATETIME")
+                conn.exec_driver_sql("UPDATE books SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
+            if "updated_at" not in columns:
+                conn.exec_driver_sql("ALTER TABLE books ADD COLUMN updated_at DATETIME")
+                conn.exec_driver_sql("UPDATE books SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL")
+
         if "characters" in tables:
             column_rows = conn.exec_driver_sql("PRAGMA table_info(characters)").fetchall()
             columns = {row[1] for row in column_rows}
@@ -54,6 +64,18 @@ def ensure_sqlite_schema():
                 conn.exec_driver_sql("ALTER TABLE characters ADD COLUMN aliases TEXT")
             if "visual_profile" not in columns:
                 conn.exec_driver_sql("ALTER TABLE characters ADD COLUMN visual_profile TEXT")
+
+        if "page_assets" in tables:
+            column_rows = conn.exec_driver_sql("PRAGMA table_info(page_assets)").fetchall()
+            columns = {row[1] for row in column_rows}
+            if "summary_short" not in columns:
+                conn.exec_driver_sql("ALTER TABLE page_assets ADD COLUMN summary_short TEXT")
+            if "continuity_summary" not in columns:
+                conn.exec_driver_sql("ALTER TABLE page_assets ADD COLUMN continuity_summary TEXT")
+            if "prompt_override" not in columns:
+                conn.exec_driver_sql("ALTER TABLE page_assets ADD COLUMN prompt_override TEXT")
+            if "last_used_prompt" not in columns:
+                conn.exec_driver_sql("ALTER TABLE page_assets ADD COLUMN last_used_prompt TEXT")
 
         if "page_characters" not in tables:
             conn.exec_driver_sql(
