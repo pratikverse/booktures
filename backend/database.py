@@ -30,7 +30,7 @@ if DATABASE_URL.startswith("sqlite"):
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragma(dbapi_connection, _connection_record):
         cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA journal_mode=DELETE;")
         cursor.execute("PRAGMA synchronous=NORMAL;")
         cursor.execute("PRAGMA busy_timeout=30000;")
         cursor.close()
@@ -56,6 +56,8 @@ def ensure_sqlite_schema():
             if "updated_at" not in columns:
                 conn.exec_driver_sql("ALTER TABLE books ADD COLUMN updated_at DATETIME")
                 conn.exec_driver_sql("UPDATE books SET updated_at = CURRENT_TIMESTAMP WHERE updated_at IS NULL")
+            if "pdf_path" not in columns:
+                conn.exec_driver_sql("ALTER TABLE books ADD COLUMN pdf_path TEXT")
 
         if "characters" in tables:
             column_rows = conn.exec_driver_sql("PRAGMA table_info(characters)").fetchall()
@@ -64,6 +66,16 @@ def ensure_sqlite_schema():
                 conn.exec_driver_sql("ALTER TABLE characters ADD COLUMN aliases TEXT")
             if "visual_profile" not in columns:
                 conn.exec_driver_sql("ALTER TABLE characters ADD COLUMN visual_profile TEXT")
+
+        if "pages" in tables:
+            column_rows = conn.exec_driver_sql("PRAGMA table_info(pages)").fetchall()
+            columns = {row[1] for row in column_rows}
+            if "weak_text" not in columns:
+                conn.exec_driver_sql("ALTER TABLE pages ADD COLUMN weak_text BOOLEAN NOT NULL DEFAULT 0")
+            if "extraction_source" not in columns:
+                conn.exec_driver_sql("ALTER TABLE pages ADD COLUMN extraction_source TEXT")
+            if "extraction_score" not in columns:
+                conn.exec_driver_sql("ALTER TABLE pages ADD COLUMN extraction_score FLOAT")
 
         if "page_assets" in tables:
             column_rows = conn.exec_driver_sql("PRAGMA table_info(page_assets)").fetchall()
@@ -76,6 +88,12 @@ def ensure_sqlite_schema():
                 conn.exec_driver_sql("ALTER TABLE page_assets ADD COLUMN prompt_override TEXT")
             if "last_used_prompt" not in columns:
                 conn.exec_driver_sql("ALTER TABLE page_assets ADD COLUMN last_used_prompt TEXT")
+            if "image_model_used" not in columns:
+                conn.exec_driver_sql("ALTER TABLE page_assets ADD COLUMN image_model_used TEXT")
+            if "image_preset_used" not in columns:
+                conn.exec_driver_sql("ALTER TABLE page_assets ADD COLUMN image_preset_used TEXT")
+            if "image_seed" not in columns:
+                conn.exec_driver_sql("ALTER TABLE page_assets ADD COLUMN image_seed INTEGER")
 
         if "page_characters" not in tables:
             conn.exec_driver_sql(
@@ -102,12 +120,3 @@ def ensure_sqlite_schema():
             conn.exec_driver_sql(
                 "CREATE INDEX ix_page_characters_character_id ON page_characters (character_id)"
             )
-
-
-# Dependency for FastAPI routes
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()

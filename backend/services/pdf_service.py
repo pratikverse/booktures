@@ -5,8 +5,9 @@ from collections import Counter
 import logging
 import re
 from typing import Any
+from pathlib import Path
 
-PDF_STORAGE_PATH = "storage/pdfs"
+PDF_STORAGE_PATH = Path(__file__).resolve().parents[1] / "storage" / "pdfs"
 logger = logging.getLogger(__name__)
 
 ROMAN_NUMERAL_PATTERN = re.compile(r"^[ivxlcdm]+$", re.IGNORECASE)
@@ -36,15 +37,14 @@ LIGATURE_REPLACEMENTS = {
 }
 
 def save_pdf(file_bytes: bytes, filename: str) -> str:
-    os.makedirs(PDF_STORAGE_PATH, exist_ok=True)
+    PDF_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
 
     unique_name = f"{uuid.uuid4()}_{filename}"
-    file_path = os.path.join(PDF_STORAGE_PATH, unique_name)
+    file_path = PDF_STORAGE_PATH / unique_name
 
-    with open(file_path, "wb") as f:
-        f.write(file_bytes)
+    file_path.write_bytes(file_bytes)
 
-    return file_path
+    return str(file_path)
 
 
 def extract_text_by_page(pdf_path: str):
@@ -64,7 +64,7 @@ def extract_text_by_page(pdf_path: str):
     with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages):
             pypdf_page = pypdf_pages[i] if i < len(pypdf_pages) else None
-            raw_text = _extract_page_text(page, pypdf_page=pypdf_page)
+            raw_text, extraction_meta = _extract_page_text(page, pypdf_page=pypdf_page)
             lines = _split_lines(raw_text)
 
             if lines:
@@ -76,7 +76,8 @@ def extract_text_by_page(pdf_path: str):
             pages.append({
                 "page_number": i + 1,
                 "lines": lines,
-                "raw_text": raw_text
+                "raw_text": raw_text,
+                "extraction_meta": extraction_meta,
             })
 
     header_candidates = _select_header_footer_candidates(
@@ -104,55 +105,82 @@ def extract_text_by_page(pdf_path: str):
             if filtered_lines
             else _normalize_text(page["raw_text"])
         )
+        # Page-number-only scraps should not be treated as narrative text downstream.
+        if _is_page_marker_only_text(cleaned_text):
+            cleaned_text = ""
+
+        weak_text = _is_weak_page_text(cleaned_text)
         cleaned_pages.append({
             "page_number": page["page_number"],
-            "text": cleaned_text
+            "text": cleaned_text,
+            "weak_text": weak_text,
+            "extraction_meta": page.get("extraction_meta", {}),
         })
 
     return cleaned_pages
 
 
 def _extract_page_text(page, pypdf_page=None):
-    candidates: list[str] = []
+    candidates: list[tuple[str, str]] = []
 
     plumber_layout = page.extract_text(layout=True, x_tolerance=1, y_tolerance=1)
     if plumber_layout:
-        candidates.append(plumber_layout)
+        candidates.append(("plumber_layout", plumber_layout))
 
     plumber_plain = page.extract_text(x_tolerance=1, y_tolerance=1)
     if plumber_plain:
-        candidates.append(plumber_plain)
+        candidates.append(("plumber_plain", plumber_plain))
 
     if pypdf_page is not None:
         try:
             pypdf_text = pypdf_page.extract_text() or ""
             if pypdf_text:
-                candidates.append(pypdf_text)
+                candidates.append(("pypdf", pypdf_text))
         except Exception as exc:
             logger.debug("pypdf extraction failed for page: %s", exc)
 
     if not candidates:
         words = page.extract_words(use_text_flow=True)
-        candidates.append(" ".join(word["text"] for word in words))
+        candidates.append(("plumber_words", " ".join(word["text"] for word in words)))
 
-    text = _pick_best_text_candidate(candidates)
+    text, source, score = _pick_best_text_candidate(candidates)
+    ocr_applied = False
+    ocr_improved = False
+    final_score = score
     if _should_try_ocr(text):
+        ocr_applied = True
         ocr_text = _extract_page_text_with_ocr(page)
-        if _extraction_score(ocr_text) > _extraction_score(text):
-            return ocr_text
-    return text
+        ocr_score = _extraction_score(ocr_text)
+        if ocr_score > score:
+            ocr_improved = True
+            final_score = ocr_score
+            source = "ocr"
+            return ocr_text, {
+                "source": source,
+                "score": round(final_score, 2),
+                "ocr_applied": ocr_applied,
+                "ocr_improved": ocr_improved,
+            }
+    return text, {
+        "source": source,
+        "score": round(final_score, 2),
+        "ocr_applied": ocr_applied,
+        "ocr_improved": ocr_improved,
+    }
 
 
-def _pick_best_text_candidate(candidates: list[str]) -> str:
+def _pick_best_text_candidate(candidates: list[tuple[str, str]]) -> tuple[str, str, float]:
     best_text = ""
+    best_source = "unknown"
     best_score = float("-inf")
-    for candidate in candidates:
+    for source, candidate in candidates:
         normalized = _normalize_text(candidate or "")
         score = _extraction_score(normalized)
         if score > best_score:
             best_score = score
             best_text = normalized
-    return best_text
+            best_source = source
+    return best_text, best_source, best_score
 
 
 def _extract_page_text_with_ocr(page) -> str:
@@ -187,7 +215,12 @@ def _should_try_ocr(text: str) -> bool:
         return True
 
     alpha_tokens = sum(1 for token in tokens if re.search(r"[A-Za-z]{2,}", token))
-    return (alpha_tokens / max(len(tokens), 1)) < 0.45
+    alpha_ratio = alpha_tokens / max(len(tokens), 1)
+    symbol_ratio = len(re.findall(r"[^A-Za-z0-9\s.,;:!?'\-\"()\[\]]", normalized)) / max(len(normalized), 1)
+    if alpha_ratio < 0.45:
+        return True
+    # Heuristic for noisy/scanned pages with many symbols and sparse readable words.
+    return symbol_ratio > 0.08 and alpha_ratio < 0.6
 
 
 def _extraction_score(text: str) -> float:
@@ -282,10 +315,6 @@ def _filter_page_lines(lines: list[str], headers: set[str], footers: set[str]) -
     for index, line in enumerate(filtered):
         if _looks_like_page_marker(line):
             continue
-        if index < 2 and _is_likely_running_header_footer(line):
-            continue
-        if index >= max(0, len(filtered) - 2) and _is_likely_running_header_footer(line):
-            continue
         if len(line.split()) <= 1 and line.strip().isdigit():
             continue
         cleaned.append(line)
@@ -332,3 +361,30 @@ def _normalize_text(text: str) -> str:
     cleaned = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", cleaned)
 
     return cleaned
+
+
+def _is_page_marker_only_text(text: str) -> bool:
+    if not text:
+        return False
+    lines = _split_lines(text)
+    if not lines:
+        return False
+    return all(_looks_like_page_marker(line) for line in lines)
+
+
+def _is_weak_page_text(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return True
+    tokens = normalized.split()
+    if len(normalized) < OCR_MIN_LENGTH_THRESHOLD:
+        return True
+    if len(tokens) < OCR_MIN_TOKEN_THRESHOLD:
+        return True
+    alpha_tokens = sum(1 for token in tokens if re.search(r"[A-Za-z]{2,}", token))
+    alpha_ratio = alpha_tokens / max(len(tokens), 1)
+    single_letter_ratio = (
+        sum(1 for token in tokens if len(token) == 1 and token.isalpha())
+        / max(len(tokens), 1)
+    )
+    return alpha_ratio < 0.45 or single_letter_ratio > 0.22

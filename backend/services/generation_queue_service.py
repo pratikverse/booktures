@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -9,7 +10,6 @@ from database import SessionLocal
 from models.generation_job import GenerationJob
 from models.page import Page
 from services.character_service import build_character_registry
-from services.evaluation_service import evaluate_book_prompts
 from services.image_generation_service import generate_page_image
 from services.prompt_service import build_page_visual_prompt, DEFAULT_STYLE_PRESET
 
@@ -17,8 +17,6 @@ logger = logging.getLogger(__name__)
 
 JOB_BOOK_PIPELINE = "book_pipeline"
 JOB_PAGE_IMAGE = "page_image"
-JOB_BOOK_EVALUATION = "book_evaluation"
-JOB_PAGE_PROMPT = "page_prompt"
 JOB_BOOK_IMAGES = "book_images"
 
 JOB_STATUS_QUEUED = "queued"
@@ -88,28 +86,22 @@ def enqueue_job(
         db.close()
 
 
-def enqueue_book_pipeline(book_id: int, style_preset: str = DEFAULT_STYLE_PRESET) -> int:
+def enqueue_book_pipeline(
+    book_id: int,
+    style_preset: str = DEFAULT_STYLE_PRESET,
+    force_prompt_refresh: Optional[bool] = None,
+) -> int:
+    resolved_force_refresh = (
+        _read_env_bool("BOOKTURES_PIPELINE_FORCE_PROMPT_REFRESH", False)
+        if force_prompt_refresh is None
+        else bool(force_prompt_refresh)
+    )
     return enqueue_job(
         book_id=book_id,
         job_type=JOB_BOOK_PIPELINE,
-        payload={"style_preset": style_preset},
-        max_attempts=2,
-    )
-
-
-def enqueue_page_prompt(
-    book_id: int,
-    page_number: int,
-    style_preset: str = DEFAULT_STYLE_PRESET,
-    force_refresh: bool = False,
-) -> int:
-    return enqueue_job(
-        book_id=book_id,
-        job_type=JOB_PAGE_PROMPT,
         payload={
-            "page_number": page_number,
             "style_preset": style_preset,
-            "force_refresh": force_refresh,
+            "force_prompt_refresh": resolved_force_refresh,
         },
         max_attempts=2,
     )
@@ -135,16 +127,6 @@ def enqueue_page_image(
     )
 
 
-def enqueue_book_evaluation(book_id: int, sample_size: int = 25) -> int:
-    sample_size = max(5, min(sample_size, 30))
-    return enqueue_job(
-        book_id=book_id,
-        job_type=JOB_BOOK_EVALUATION,
-        payload={"sample_size": sample_size},
-        max_attempts=2,
-    )
-
-
 def enqueue_book_images(
     book_id: int,
     style_preset: str = DEFAULT_STYLE_PRESET,
@@ -161,17 +143,6 @@ def enqueue_book_images(
         },
         max_attempts=2,
     )
-
-
-def get_job(job_id: int) -> Optional[dict]:
-    db = SessionLocal()
-    try:
-        job = db.get(GenerationJob, job_id)
-        if job is None:
-            return None
-        return _serialize_job(job)
-    finally:
-        db.close()
 
 
 def pause_job(job_id: int) -> Optional[dict]:
@@ -349,6 +320,7 @@ def _run_job(job_id: int):
 def _dispatch_job(job: GenerationJob, payload: dict) -> dict:
     if job.job_type == JOB_BOOK_PIPELINE:
         style_preset = payload.get("style_preset", DEFAULT_STYLE_PRESET)
+        force_prompt_refresh = bool(payload.get("force_prompt_refresh", False))
         _update_job_progress(job.id, 0.05, "building_character_registry")
         build_character_registry(job.book_id)
         _check_job_control(job.id)
@@ -372,26 +344,12 @@ def _dispatch_job(job: GenerationJob, payload: dict) -> dict:
                 book_id=job.book_id,
                 page_number=page.page_number,
                 style_preset=style_preset,
-                force_refresh=False,
+                force_refresh=force_prompt_refresh,
             )
             progress = 0.35 + (0.6 * (idx / total))
             _update_job_progress(job.id, progress, f"prompt_cached_page_{page.page_number}")
             _check_job_control(job.id)
         return {"book_id": job.book_id, "pages_processed": len(pages)}
-
-    if job.job_type == JOB_PAGE_PROMPT:
-        _check_job_control(job.id)
-        page_number = int(payload["page_number"])
-        style_preset = payload.get("style_preset", DEFAULT_STYLE_PRESET)
-        force_refresh = bool(payload.get("force_refresh", False))
-        data = build_page_visual_prompt(
-            book_id=job.book_id,
-            page_number=page_number,
-            style_preset=style_preset,
-            force_refresh=force_refresh,
-        )
-        _check_job_control(job.id)
-        return {"book_id": job.book_id, "page_number": page_number, "prompt_status": data.get("status")}
 
     if job.job_type == JOB_PAGE_IMAGE:
         _check_job_control(job.id)
@@ -404,13 +362,6 @@ def _dispatch_job(job: GenerationJob, payload: dict) -> dict:
             force_prompt_refresh=bool(payload.get("force_prompt_refresh", False)),
             force_regenerate=bool(payload.get("force_regenerate", False)),
         )
-        _check_job_control(job.id)
-        return result
-
-    if job.job_type == JOB_BOOK_EVALUATION:
-        _check_job_control(job.id)
-        sample_size = int(payload.get("sample_size", 25))
-        result = evaluate_book_prompts(book_id=job.book_id, sample_size=sample_size, force_refresh=False)
         _check_job_control(job.id)
         return result
 
@@ -571,6 +522,13 @@ def _read_payload(payload: Optional[str]) -> dict:
     except json.JSONDecodeError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _read_env_bool(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _serialize_job(job: GenerationJob) -> dict:

@@ -9,6 +9,7 @@ type ApiBook = {
   page_count: number
   processed_pages: number
   status: Book['status']
+  pdf_url?: string | null
   created_at?: string | null
   updated_at?: string | null
 }
@@ -28,10 +29,13 @@ type ApiJob = {
   id: number
   book_id: number
   book_title: string
-  type: Job['type']
+  type?: 'single_page' | 'full_book'
+  job_type?: Job['type']
   status: Job['status']
   progress: number
+  created_at?: string | null
   started_at?: string | null
+  completed_at?: string | null
   updated_at?: string | null
   error_message?: string | null
   page_number?: number | null
@@ -76,6 +80,7 @@ type ApiSettings = {
   ollama_url: string
   model_name: string
   timeout: number
+  image_mode: Settings['imageMode']
   image_model: string
   image_width: number
   image_height: number
@@ -119,6 +124,7 @@ function mapBook(book: ApiBook): Book {
     pageCount: book.page_count,
     processedPages: book.processed_pages,
     status: book.status,
+    pdfUrl: resolveApiUrl(book.pdf_url),
     createdAt: book.created_at,
     updatedAt: book.updated_at,
   }
@@ -138,14 +144,19 @@ function mapPage(page: ApiPage): Page {
 }
 
 function mapJob(job: ApiJob): Job {
+  const normalizedType: Job['type'] =
+    job.job_type ?? (job.type === 'single_page' ? 'page_image' : 'book_images')
+
   return {
     id: job.id,
     bookId: job.book_id,
     bookTitle: job.book_title,
-    type: job.type,
+    type: normalizedType,
     status: job.status,
     progress: job.progress,
+    createdAt: job.created_at ?? null,
     startedAt: job.started_at,
+    completedAt: job.completed_at ?? null,
     updatedAt: job.updated_at,
     errorMessage: job.error_message ?? undefined,
     pageNumber: job.page_number ?? undefined,
@@ -179,6 +190,7 @@ function mapSettings(settings: ApiSettings): Settings {
     ollamaUrl: settings.ollama_url,
     modelName: settings.model_name,
     timeout: settings.timeout,
+    imageMode: settings.image_mode,
     imageModel: settings.image_model,
     imageWidth: settings.image_width,
     imageHeight: settings.image_height,
@@ -192,6 +204,7 @@ function unmapSettings(settings: Settings): ApiSettings {
     ollama_url: settings.ollamaUrl,
     model_name: settings.modelName,
     timeout: settings.timeout,
+    image_mode: settings.imageMode,
     image_model: settings.imageModel,
     image_width: settings.imageWidth,
     image_height: settings.imageHeight,

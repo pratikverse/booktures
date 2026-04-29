@@ -44,6 +44,15 @@ STYLE_PRESETS = {
     },
 }
 
+DEFAULT_LEGAL_PAGE_PATTERNS = [
+    r"without any warranty",
+    r"merchantabilit(?:y|ies)",
+    r"all rights reserved",
+    r"public domain",
+    r"project gutenberg",
+    r"copyright",
+]
+
 
 def build_page_visual_prompt(
     book_id: int,
@@ -97,6 +106,8 @@ def build_page_visual_prompt(
             page_number=page.page_number,
             continuity_context=continuity_context,
             characters=characters,
+            weak_text=bool(getattr(page, "weak_text", False)),
+            extraction_score=getattr(page, "extraction_score", None),
         )
         scene_summary = page_summary["full_summary"]
         summary_short = page_summary["condensed_summary"]
@@ -242,6 +253,8 @@ def _build_page_summary(
     page_number: int,
     continuity_context: dict,
     characters: list[dict],
+    weak_text: bool = False,
+    extraction_score: float | None = None,
 ) -> dict:
     cleaned = re.sub(r"\s+", " ", (text or "").strip())
     page_kind = _classify_page_kind(cleaned, page_number)
@@ -267,7 +280,14 @@ def _build_page_summary(
     if page_kind != "story":
         return _summarize_non_story_page(cleaned, page_number, page_kind, continuity_context)
 
+    if weak_text or _is_low_extraction_score(extraction_score):
+        details = _fallback_page_summary(cleaned, page_number, continuity_context, characters)
+        details["scene_change"] = details.get("scene_change") or "source text is weak; preserve continuity and avoid invented detail"
+        return _ensure_page_summary_defaults(details, cleaned, page_number, continuity_context, characters)
+
     details = _summarize_page_with_ollama(cleaned, continuity_context, characters)
+    if details and not _is_summary_output_usable(cleaned, details):
+        details = {}
     if not details:
         details = _fallback_page_summary(cleaned, page_number, continuity_context, characters)
 
@@ -344,7 +364,8 @@ def _summarize_page_with_ollama(text: str, continuity_context: dict, characters:
                 "content": (
                     "You condense a full book page into a visual summary for illustration planning. "
                     "Return valid JSON only using exactly the requested keys. "
-                    "Make the condensed summary specific to this page, with concrete imagery, actions, and changes from previous pages."
+                    "Make the condensed summary specific to this page, with concrete imagery, actions, and changes from previous pages. "
+                    "Avoid vague wording like 'something happens' or 'a dramatic moment'; always name visible actions, props, positions, and spatial relationships."
                 ),
             },
             {
@@ -359,6 +380,8 @@ def _summarize_page_with_ollama(text: str, continuity_context: dict, characters:
                     "Instructions:\n"
                     "- Capture what is visually unique about this page.\n"
                     "- Keep character appearance consistent with known anchors.\n"
+                    "- Prefer concrete nouns and verbs over abstract adjectives.\n"
+                    "- If the source text is weak, stay grounded and avoid inventing plot facts.\n"
                     "- Make continuity_anchor a short note about what should stay stable from previous pages.\n"
                     "- Make scene_change explain what visually changes on this page versus earlier context.\n"
                     "- condensed_summary should be 2 to 3 sentences and image-friendly.\n\n"
@@ -366,7 +389,7 @@ def _summarize_page_with_ollama(text: str, continuity_context: dict, characters:
                 ),
             },
         ],
-        "temperature": 0.2,
+        "temperature": _read_env_float("BOOKTURES_SUMMARY_TEMPERATURE", 0.2),
         "response_format": {"type": "json_object"},
     }
 
@@ -424,7 +447,8 @@ def _prompt_with_ollama(
                 "content": (
                     "You write one image-generation prompt for a single book page. "
                     "Return valid JSON only with key visual_prompt. "
-                    "The prompt must prioritize the current page's distinctive scene while keeping characters consistent with previous pages."
+                    "The prompt must prioritize the current page's distinctive scene while keeping characters consistent with previous pages. "
+                    "Use concrete visual staging and avoid generic cinematic filler."
                 ),
             },
             {
@@ -462,12 +486,13 @@ def _prompt_with_ollama(
                     + "- Mention named characters only if they are present.\n"
                     + "- Preserve face, hair, clothing, and silhouette continuity when characters reappear.\n"
                     + "- Prefer concrete props, gestures, staging, and environment changes over boilerplate style words.\n"
+                    + "- Include subject, action, setting depth, and one clear focal composition choice.\n"
                     + "- Keep it under 170 words.\n\n"
                     + f"Output format (exact keys): {output_schema}"
                 ),
             },
         ],
-        "temperature": 0.35,
+        "temperature": _read_env_float("BOOKTURES_PROMPT_TEMPERATURE", 0.35),
         "response_format": {"type": "json_object"},
     }
 
@@ -478,7 +503,7 @@ def _prompt_with_ollama(
         parsed = _parse_json_maybe(content)
         if isinstance(parsed, dict):
             visual_prompt = _normalize_inline_text(parsed.get("visual_prompt", ""))
-            if visual_prompt:
+            if visual_prompt and _is_prompt_output_usable(page_summary, visual_prompt):
                 return visual_prompt
     except (requests.RequestException, ValueError, KeyError) as exc:
         logger.debug("Ollama prompt composition failed, using fallback: %s", exc)
@@ -693,7 +718,8 @@ def _classify_page_kind(text: str, page_number: int) -> str:
         return "blank"
     if page_number <= 3 and ("table of contents" in lower or "contents" in lower):
         return "contents"
-    if "without any warranty" in lower or "merchantablity" in lower or "sherlock-holm.es" in lower:
+    legal_patterns = _read_env_list("BOOKTURES_LEGAL_PAGE_PATTERNS", DEFAULT_LEGAL_PAGE_PATTERNS)
+    if any(re.search(pattern, lower) for pattern in legal_patterns):
         return "legal"
     if page_number <= 2 and len(cleaned.split()) <= 12:
         return "title"
@@ -903,3 +929,63 @@ def _guard_prompt(prompt: str) -> str:
 
 def _prompt_matches_current_pipeline(prompt: str) -> bool:
     return PROMPT_PIPELINE_MARKER in (prompt or "").lower()
+
+
+def _read_env_float(name: str, default: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _read_env_list(name: str, default: list[str]) -> list[str]:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    values = [item.strip() for item in raw.split("||") if item.strip()]
+    return values or default
+
+
+def _is_low_extraction_score(extraction_score: float | None) -> bool:
+    if extraction_score is None:
+        return False
+    threshold = _read_env_float("BOOKTURES_MIN_EXTRACTION_SCORE", 120.0)
+    return float(extraction_score) < threshold
+
+
+def _is_summary_output_usable(source_text: str, details: dict) -> bool:
+    min_summary_chars = int(_read_env_float("BOOKTURES_MIN_SUMMARY_CHARS", 80))
+    max_copy_ratio = _read_env_float("BOOKTURES_MAX_SUMMARY_COPY_RATIO", 0.92)
+    full_summary = _normalize_inline_text(details.get("full_summary") or details.get("summary") or "")
+    condensed = _normalize_inline_text(details.get("condensed_summary") or details.get("visual_summary") or "")
+    if len(full_summary) < min_summary_chars or len(condensed) < max(40, min_summary_chars // 2):
+        return False
+    source = _normalize_inline_text(source_text)
+    if not source:
+        return True
+    overlap = _token_overlap_ratio(source, full_summary)
+    return overlap < max_copy_ratio
+
+
+def _is_prompt_output_usable(page_summary: dict, visual_prompt: str) -> bool:
+    min_prompt_chars = int(_read_env_float("BOOKTURES_MIN_PROMPT_CHARS", 100))
+    max_copy_ratio = _read_env_float("BOOKTURES_MAX_PROMPT_COPY_RATIO", 0.95)
+    cleaned_prompt = _normalize_inline_text(visual_prompt)
+    if len(cleaned_prompt) < min_prompt_chars:
+        return False
+    summary_text = _normalize_inline_text(page_summary.get("full_summary", ""))
+    if not summary_text:
+        return True
+    overlap = _token_overlap_ratio(summary_text, cleaned_prompt)
+    return overlap < max_copy_ratio
+
+
+def _token_overlap_ratio(a: str, b: str) -> float:
+    a_tokens = {token for token in re.findall(r"[a-z0-9']+", a.lower()) if len(token) > 2}
+    b_tokens = {token for token in re.findall(r"[a-z0-9']+", b.lower()) if len(token) > 2}
+    if not a_tokens:
+        return 0.0
+    return len(a_tokens & b_tokens) / max(len(a_tokens), 1)

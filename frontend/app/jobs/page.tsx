@@ -81,7 +81,10 @@ export default function JobsPage() {
         }
         const statusDiff = statusOrder[a.status] - statusOrder[b.status]
         if (statusDiff !== 0) return statusDiff
-        return new Date(b.updatedAt ?? 0).getTime() - new Date(a.updatedAt ?? 0).getTime()
+        const toEpoch = (value?: string | null) => (value ? new Date(value).getTime() : Number.NEGATIVE_INFINITY)
+        const timestampA = toEpoch(a.completedAt) || toEpoch(a.startedAt) || toEpoch(a.createdAt)
+        const timestampB = toEpoch(b.completedAt) || toEpoch(b.startedAt) || toEpoch(b.createdAt)
+        return timestampB - timestampA
       }),
     [jobs]
   )

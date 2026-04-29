@@ -44,10 +44,20 @@ function getRelativeTime(dateString?: string | null) {
 }
 
 export function JobCard({ job, className, actionState = 'idle', onPause, onResume, onCancel }: JobCardProps) {
-  const Icon = job.type === 'full_book' ? BookOpen : FileText
+  const Icon = job.type === 'page_image' ? FileText : BookOpen
   const canPause = job.status === 'queued' || job.status === 'running'
   const canResume = job.status === 'paused'
   const canCancel = job.status === 'queued' || job.status === 'running' || job.status === 'paused'
+
+  const typeLabel: Record<Job['type'], string> = {
+    book_pipeline: 'Processing book',
+    page_prompt: 'Generating prompts',
+    page_image: 'Generating image',
+    book_images: 'Generating all images',
+  }
+
+  const createdLabel = formatDateTime(job.createdAt)
+  const phaseAt = job.completedAt ?? job.startedAt
 
   return (
     <div
@@ -97,7 +107,8 @@ export function JobCard({ job, className, actionState = 'idle', onPause, onResum
                 {job.bookTitle}
               </Link>
               <p className="mt-0.5 text-xs text-muted-foreground">
-                {job.type === 'full_book' ? 'Full book generation' : `Page ${job.pageNumber} generation`}
+                {typeLabel[job.type]}
+                {job.type === 'page_image' && job.pageNumber ? ` (Page ${job.pageNumber})` : ''}
                 <span className="mx-1.5">-</span>
                 <span className="font-mono">{job.id}</span>
               </p>
@@ -121,9 +132,11 @@ export function JobCard({ job, className, actionState = 'idle', onPause, onResum
           <div className="mt-3 flex items-center gap-4 text-xs text-muted-foreground">
             <span className="flex items-center gap-1">
               <Clock className="h-3 w-3" />
-              Started {formatDateTime(job.startedAt)}
+              Created {createdLabel}
             </span>
-            <span>Updated {getRelativeTime(job.updatedAt)}</span>
+            <span>
+              {job.completedAt ? 'Completed' : 'Started'} {phaseAt ? getRelativeTime(phaseAt) : 'Not started yet'}
+            </span>
           </div>
 
           {(canPause || canResume || canCancel) && (

@@ -390,16 +390,26 @@ export default function BookReaderPage({ params }: ReaderPageProps) {
                 <div className="border-b border-border px-5 py-4">
                   <div className="flex items-center justify-between gap-3">
                     <div>
-                      <h2 className="text-lg font-semibold text-foreground">Book Text</h2>
-                      <p className="text-sm text-muted-foreground">Page {selectedPage.pageNumber} source text</p>
+                      <h2 className="text-lg font-semibold text-foreground">Book Page</h2>
+                      <p className="text-sm text-muted-foreground">PDF page {selectedPage.pageNumber}</p>
                     </div>
                     <StatusBadge status={selectedPage.status} />
                   </div>
                 </div>
                 <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
-                  <div className="max-w-none text-sm leading-7 text-foreground">
-                    <p className="whitespace-pre-wrap">{selectedPage.textExcerpt || 'No text available for this page yet.'}</p>
-                  </div>
+                  {book?.pdfUrl ? (
+                    <div className="h-full min-h-[480px] overflow-hidden rounded-xl border border-border bg-background">
+                      <iframe
+                        title={`PDF page ${selectedPage.pageNumber}`}
+                        src={`${book.pdfUrl}#page=${selectedPage.pageNumber}&view=FitH`}
+                        className="h-full w-full"
+                      />
+                    </div>
+                  ) : (
+                    <div className="max-w-none text-sm leading-7 text-foreground">
+                      <p className="whitespace-pre-wrap">{selectedPage.textExcerpt || 'No PDF available for this book yet.'}</p>
+                    </div>
+                  )}
                 </div>
               </section>
 
@@ -419,14 +429,14 @@ export default function BookReaderPage({ params }: ReaderPageProps) {
                 <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
                   <div className="space-y-5">
                     <div className="overflow-hidden rounded-2xl border border-border bg-secondary/40">
-                      <div className="aspect-[3/4] w-full bg-secondary">
+                      <div className="flex h-[min(54vh,680px)] w-full items-center justify-center bg-secondary p-2">
                         {assetLoading ? (
                           <Skeleton className="h-full w-full rounded-none" />
                         ) : selectedPage.imageUrl ? (
                           <img
                             src={selectedPage.imageUrl}
                             alt={`Illustration for page ${selectedPage.pageNumber}`}
-                            className="h-full w-full object-cover"
+                            className="max-h-full w-auto max-w-full object-contain"
                           />
                         ) : (
                           <div className="flex h-full items-center justify-center">

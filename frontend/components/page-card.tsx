@@ -31,8 +31,16 @@ export function PageCard({
   className,
 }: PageCardProps) {
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={() => onSelect?.(page)}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          onSelect?.(page)
+        }
+      }}
       className={cn(
         'group relative flex flex-col rounded-xl border bg-card p-3 text-left transition-all',
         'hover:bg-accent/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
@@ -96,6 +104,6 @@ export function PageCard({
           )}
         </div>
       </div>
-    </button>
+    </div>
   )
 }

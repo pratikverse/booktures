@@ -36,6 +36,17 @@ export default function LibraryPage() {
     void loadLibrary()
   }, [loadLibrary])
 
+  useEffect(() => {
+    const hasProcessingBooks = books.some((book) => book.status === 'processing')
+    if (!hasProcessingBooks) return
+
+    const intervalId = window.setInterval(() => {
+      void loadLibrary()
+    }, 5000)
+
+    return () => window.clearInterval(intervalId)
+  }, [books, loadLibrary])
+
   const filteredBooks = useMemo(
     () =>
         books.filter((book) => {

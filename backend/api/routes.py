@@ -1,8 +1,6 @@
 import json
 import logging
 from pathlib import PurePath
-import requests
-
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
@@ -58,6 +56,18 @@ def create_book_placeholder(filename: str, source: str) -> Book:
         return book_record
     finally:
         db.close()
+
+
+def _build_pdf_url(pdf_path: str | None) -> str | None:
+    if not pdf_path:
+        return None
+    normalized = PurePath(pdf_path).as_posix()
+    marker = "storage/pdfs/"
+    marker_index = normalized.find(marker)
+    if marker_index == -1:
+        return None
+    relative_path = normalized[marker_index + len(marker):]
+    return f"/storage/pdfs/{relative_path}"
 
 
 def _extract_page_number_from_job(job: GenerationJob, page_lookup: dict[int, Page]) -> int | None:
@@ -131,9 +141,14 @@ def _serialize_book(
     active_jobs = sum(1 for job in jobs if job.status in {"queued", "running"})
     total_pages = int(book.total_pages or len(pages) or 0)
 
-    if total_pages == 0 or active_jobs > 0 and processed_pages == 0 and failed_pages == 0:
+    if total_pages == 0:
         status = "processing"
     elif total_pages > 0 and processed_pages >= total_pages:
+        status = "ready"
+    elif active_jobs > 0 and processed_pages == 0 and failed_pages == 0:
+        status = "processing"
+    elif active_jobs == 0 and failed_pages == 0:
+        # Prompt pipeline can be complete even before any images are generated.
         status = "ready"
     elif failed_pages > 0 and processed_pages == 0 and active_jobs == 0:
         status = "failed"
@@ -149,6 +164,7 @@ def _serialize_book(
         "processed_pages": processed_pages,
         "status": status,
         "source": book.source,
+        "pdf_url": _build_pdf_url(getattr(book, "pdf_path", None)),
         "created_at": book.created_at.isoformat() if getattr(book, "created_at", None) else None,
         "updated_at": book.updated_at.isoformat() if getattr(book, "updated_at", None) else None,
     }
@@ -193,10 +209,13 @@ def _serialize_job(job: GenerationJob, book_lookup: dict[int, Book], page_lookup
         "id": job.id,
         "book_id": job.book_id,
         "book_title": book.title if book is not None else f"Book {job.book_id}",
+        "job_type": job.job_type,
         "type": "single_page" if is_page_job else "full_book",
         "status": job.status,
         "progress": int(round(float(job.progress or 0.0) * 100)),
+        "created_at": job.created_at.isoformat() if job.created_at else None,
         "started_at": (job.started_at or job.created_at).isoformat() if (job.started_at or job.created_at) else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
         "updated_at": (job.updated_at or job.created_at).isoformat() if (job.updated_at or job.created_at) else None,
         "error_message": job.last_error,
         "page_number": page_number,
@@ -216,10 +235,18 @@ def finalize_book_pages(book_id: int, pdf_path: str):
             return
 
         for page_data in pages:
+            extraction_meta = page_data.get("extraction_meta", {}) if isinstance(page_data, dict) else {}
             page_record = Page(
                 book_id=book_id,
                 page_number=page_data["page_number"],
                 text=page_data["text"],
+                weak_text=bool(page_data.get("weak_text", False)),
+                extraction_source=(extraction_meta.get("source") or None),
+                extraction_score=(
+                    float(extraction_meta["score"])
+                    if extraction_meta.get("score") is not None
+                    else None
+                ),
             )
             db.add(page_record)
 
@@ -354,6 +381,15 @@ async def upload_pdf(
         file_bytes = await file.read()
         pdf_path = save_pdf(file_bytes, file.filename)
         book_record = create_book_placeholder(file.filename, source="local")
+        db = SessionLocal()
+        try:
+            persisted_book = db.get(Book, book_record.id)
+            if persisted_book is not None:
+                persisted_book.pdf_path = pdf_path
+                db.add(persisted_book)
+                db.commit()
+        finally:
+            db.close()
         background_tasks.add_task(finalize_book_pages, book_record.id, pdf_path)
 
         return {
@@ -384,6 +420,7 @@ class SettingsPayload(BaseModel):
     ollama_url: str
     model_name: str
     timeout: int
+    image_mode: str = "balanced"
     image_model: str
     image_width: int
     image_height: int
@@ -475,6 +512,9 @@ def get_page_asset(book_id: int, page_number: int):
                 "image_path": None,
                 "image_url": None,
                 "image_status": "pending",
+                "image_model_used": None,
+                "image_preset_used": None,
+                "image_seed": None,
                 "last_error": None,
             }
         return {
@@ -497,6 +537,9 @@ def get_page_asset(book_id: int, page_number: int):
                 getattr(asset, "image_generated_at", None) or getattr(asset, "updated_at", None),
             ),
             "image_status": asset.image_status,
+            "image_model_used": getattr(asset, "image_model_used", None),
+            "image_preset_used": getattr(asset, "image_preset_used", None),
+            "image_seed": getattr(asset, "image_seed", None),
             "last_error": asset.last_error,
         }
     finally:
@@ -545,6 +588,9 @@ def update_page_prompt(book_id: int, page_number: int, body: PromptOverridePaylo
                 getattr(asset, "image_generated_at", None) or getattr(asset, "updated_at", None),
             ),
             "image_status": asset.image_status,
+            "image_model_used": getattr(asset, "image_model_used", None),
+            "image_preset_used": getattr(asset, "image_preset_used", None),
+            "image_seed": getattr(asset, "image_seed", None),
             "last_error": asset.last_error,
         }
     finally:
@@ -622,3 +668,5 @@ def cancel_generation_job(job_id: int):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+    if body.image_mode not in {"quality", "balanced", "fast", "custom"}:
+        raise HTTPException(status_code=400, detail="Image mode must be one of: quality, balanced, fast, custom")

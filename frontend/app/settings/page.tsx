@@ -5,6 +5,7 @@ import { AppShell } from '@/components/app-shell'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import {
   Card,
   CardContent,
@@ -20,10 +21,19 @@ import { getSettings, saveSettings } from '@/lib/api'
 type SaveState = 'idle' | 'saving' | 'saved' | 'error'
 type LoadState = 'loading' | 'ready' | 'error'
 
+const IMAGE_MODEL_OPTIONS = [
+  { value: 'stabilityai/stable-diffusion-xl-base-1.0', label: 'SDXL Base 1.0' },
+  { value: 'segmind/SSD-1B', label: 'Segmind SSD-1B' },
+  { value: 'stabilityai/sd-turbo', label: 'SD Turbo' },
+  { value: 'Lykon/dreamshaper-xl-1-0', label: 'DreamShaper XL' },
+  { value: 'SG161222/RealVisXL_V4.0', label: 'RealVisXL V4.0' },
+]
+
 const emptySettings: Settings = {
   ollamaUrl: '',
   modelName: '',
   timeout: 45,
+  imageMode: 'balanced',
   imageWidth: 512,
   imageHeight: 768,
   imageSteps: 6,
@@ -37,6 +47,7 @@ export default function SettingsPage() {
   const [loadState, setLoadState] = useState<LoadState>('loading')
   const [errors, setErrors] = useState<Partial<Record<keyof Settings, string>>>({})
   const [serverError, setServerError] = useState<string | null>(null)
+  const [useCustomModelInput, setUseCustomModelInput] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -48,6 +59,7 @@ export default function SettingsPage() {
         const loaded = await getSettings()
         if (cancelled) return
         setSettings(loaded)
+        setUseCustomModelInput(!IMAGE_MODEL_OPTIONS.some((option) => option.value === loaded.imageModel))
         setLoadState('ready')
       } catch (error) {
         if (cancelled) return
@@ -99,7 +111,7 @@ export default function SettingsPage() {
       newErrors.imageGuidance = 'Guidance must be between 1 and 20'
     }
 
-    if (!settings.imageModel.trim()) {
+    if (settings.imageMode === 'custom' && !settings.imageModel.trim()) {
       newErrors.imageModel = 'Image model is required'
     }
 
@@ -239,20 +251,74 @@ export default function SettingsPage() {
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="space-y-2">
+                <Label htmlFor="imageMode">Generation Mode</Label>
+                <Select
+                  value={settings.imageMode}
+                  onValueChange={(value) => updateSetting('imageMode', value as Settings['imageMode'])}
+                  disabled={loadState === 'loading' || saveState === 'saving'}
+                >
+                  <SelectTrigger id="imageMode" className="w-full">
+                    <SelectValue placeholder="Choose generation mode" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="quality">Quality</SelectItem>
+                    <SelectItem value="balanced">Balanced</SelectItem>
+                    <SelectItem value="fast">Fast</SelectItem>
+                    <SelectItem value="custom">Custom</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  Quality and speed presets auto-tune model and parameters. Custom uses your manual model settings.
+                </p>
+              </div>
+
+              <div className="space-y-2">
                 <Label htmlFor="imageModel">Image Model</Label>
+                <Select
+                  value={
+                    useCustomModelInput || !IMAGE_MODEL_OPTIONS.some((option) => option.value === settings.imageModel)
+                      ? '__custom__'
+                      : settings.imageModel
+                  }
+                  onValueChange={(value) => {
+                    if (value === '__custom__') {
+                      setUseCustomModelInput(true)
+                      return
+                    }
+                    setUseCustomModelInput(false)
+                    updateSetting('imageModel', value)
+                  }}
+                  disabled={loadState === 'loading' || saveState === 'saving' || settings.imageMode !== 'custom'}
+                >
+                  <SelectTrigger id="imageModelPreset" className="w-full">
+                    <SelectValue placeholder="Choose image model" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {IMAGE_MODEL_OPTIONS.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                    <SelectItem value="__custom__">Custom model...</SelectItem>
+                  </SelectContent>
+                </Select>
+                {useCustomModelInput && (
                   <Input
                     id="imageModel"
                     placeholder="segmind/SSD-1B"
                     value={settings.imageModel}
                     onChange={(e) => updateSetting('imageModel', e.target.value)}
-                    disabled={loadState === 'loading' || saveState === 'saving'}
+                    disabled={loadState === 'loading' || saveState === 'saving' || settings.imageMode !== 'custom'}
                     className={errors.imageModel ? 'border-status-failed' : ''}
                   />
+                )}
                 {errors.imageModel ? (
                   <p className="text-xs text-status-failed">{errors.imageModel}</p>
                 ) : (
                   <p className="text-xs text-muted-foreground">
-                    The name of the image generation model
+                    {settings.imageMode === 'custom'
+                      ? 'The exact image model to use in custom mode'
+                      : 'Preset mode controls model selection automatically'}
                   </p>
                 )}
               </div>
@@ -271,7 +337,7 @@ export default function SettingsPage() {
                     placeholder="1024"
                     value={settings.imageWidth}
                     onChange={(e) => updateSetting('imageWidth', parseInt(e.target.value) || 0)}
-                    disabled={loadState === 'loading' || saveState === 'saving'}
+                    disabled={loadState === 'loading' || saveState === 'saving' || settings.imageMode !== 'custom'}
                     className={errors.imageWidth ? 'border-status-failed' : ''}
                   />
                   {errors.imageWidth && (
@@ -290,7 +356,7 @@ export default function SettingsPage() {
                     placeholder="1024"
                     value={settings.imageHeight}
                     onChange={(e) => updateSetting('imageHeight', parseInt(e.target.value) || 0)}
-                    disabled={loadState === 'loading' || saveState === 'saving'}
+                    disabled={loadState === 'loading' || saveState === 'saving' || settings.imageMode !== 'custom'}
                     className={errors.imageHeight ? 'border-status-failed' : ''}
                   />
                   {errors.imageHeight && (
@@ -310,7 +376,7 @@ export default function SettingsPage() {
                     placeholder="30"
                     value={settings.imageSteps}
                     onChange={(e) => updateSetting('imageSteps', parseInt(e.target.value) || 0)}
-                    disabled={loadState === 'loading' || saveState === 'saving'}
+                    disabled={loadState === 'loading' || saveState === 'saving' || settings.imageMode !== 'custom'}
                     className={errors.imageSteps ? 'border-status-failed' : ''}
                   />
                   {errors.imageSteps ? (
@@ -333,7 +399,7 @@ export default function SettingsPage() {
                     placeholder="7.5"
                     value={settings.imageGuidance}
                     onChange={(e) => updateSetting('imageGuidance', parseFloat(e.target.value) || 0)}
-                    disabled={loadState === 'loading' || saveState === 'saving'}
+                    disabled={loadState === 'loading' || saveState === 'saving' || settings.imageMode !== 'custom'}
                     className={errors.imageGuidance ? 'border-status-failed' : ''}
                   />
                   {errors.imageGuidance ? (

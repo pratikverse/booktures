@@ -5,5 +5,4 @@ from . import (
     page_character,
     page_asset,
     generation_job,
-    page_evaluation,
 )

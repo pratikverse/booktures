@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from database import engine, Base, ensure_sqlite_schema
 from models import (  # ensure models register with Base
     book,
@@ -9,7 +10,6 @@ from models import (  # ensure models register with Base
     page_character,
     page_asset,
     generation_job,
-    page_evaluation,
 )
 from api.routes import router
 from services.generation_queue_service import start_worker, stop_worker
@@ -35,7 +35,19 @@ app.add_middleware(
 )
 
 app.include_router(router)
-app.mount("/storage/images", StaticFiles(directory="storage/images", check_dir=False), name="storage-images")
+_BACKEND_ROOT = Path(__file__).resolve().parent
+_IMAGE_DIR = _BACKEND_ROOT / "storage" / "images"
+_PDF_DIR = _BACKEND_ROOT / "storage" / "pdfs"
+app.mount(
+    "/storage/images",
+    StaticFiles(directory=str(_IMAGE_DIR), check_dir=False),
+    name="storage-images",
+)
+app.mount(
+    "/storage/pdfs",
+    StaticFiles(directory=str(_PDF_DIR), check_dir=False),
+    name="storage-pdfs",
+)
 
 
 @app.on_event("startup")

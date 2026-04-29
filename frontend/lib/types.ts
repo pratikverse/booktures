@@ -2,7 +2,7 @@
 export type PageStatus = 'prompt_ready' | 'image_queued' | 'image_ready' | 'failed'
 export type BookStatus = 'processing' | 'ready' | 'partial' | 'failed'
 export type JobStatus = 'queued' | 'running' | 'paused' | 'canceled' | 'completed' | 'failed'
-export type JobType = 'single_page' | 'full_book'
+export type JobType = 'book_pipeline' | 'page_prompt' | 'page_image' | 'book_images'
 
 export interface Book {
   id: number
@@ -10,6 +10,7 @@ export interface Book {
   pageCount: number
   processedPages: number
   status: BookStatus
+  pdfUrl?: string
   createdAt?: string | null
   updatedAt?: string | null
   coverUrl?: string
@@ -33,7 +34,9 @@ export interface Job {
   type: JobType
   status: JobStatus
   progress: number
+  createdAt?: string | null
   startedAt?: string | null
+  completedAt?: string | null
   updatedAt?: string | null
   errorMessage?: string
   pageNumber?: number
@@ -43,6 +46,7 @@ export interface Settings {
   ollamaUrl: string
   modelName: string
   timeout: number
+  imageMode: 'quality' | 'balanced' | 'fast' | 'custom'
   imageWidth: number
   imageHeight: number
   imageSteps: number
