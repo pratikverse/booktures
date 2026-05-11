@@ -1,16 +1,51 @@
+"""
+PDF Service: Manages the lifecycle of PDF files and provides high-fidelity text extraction.
+It focuses on identifying narrative text while filtering out structural noise like headers and footers.
+Ollama integration adds LLM-backed quality evaluation, header/footer classification, and OCR repair.
+"""
+
 import os
 import uuid
+import json
 import pdfplumber
+import httpx
+import pytesseract
 from collections import Counter
+from dotenv import load_dotenv
+from functools import lru_cache
 import logging
 import re
 from typing import Any
 from pathlib import Path
 
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Configuration for storage and logging
+# ---------------------------------------------------------------------------
 PDF_STORAGE_PATH = Path(__file__).resolve().parents[1] / "storage" / "pdfs"
 logger = logging.getLogger(__name__)
 
+# Allow overriding the Tesseract binary path via environment variable
+TESSERACT_CMD = os.getenv("TESSERACT_CMD")
+if TESSERACT_CMD:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+# ---------------------------------------------------------------------------
+# Ollama Configuration
+# ---------------------------------------------------------------------------
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_DEFAULT_MODEL = os.getenv("OLLAMA_DEFAULT_MODEL", "qwen2.5:7b")
+OLLAMA_FAST_MODEL = os.getenv("OLLAMA_FAST_MODEL", "phi3")
+
+OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180.0"))
+OLLAMA_ENABLED = os.getenv("OLLAMA_ENABLED", "True").lower() == "true"
+
+# ---------------------------------------------------------------------------
+# Regex Patterns for Identifying Metadata and Noise
+# ---------------------------------------------------------------------------
 ROMAN_NUMERAL_PATTERN = re.compile(r"^[ivxlcdm]+$", re.IGNORECASE)
+# Matches common page number formats: "Page 1", "pg. 4", or standalone numbers/roman numerals
 PAGE_COUNTER_PATTERN = re.compile(
     r"^(page|pg)\.?\s*[\divxlcdm]+$|^[\divxlcdm]+$",
     re.IGNORECASE,
@@ -19,11 +54,19 @@ SECTION_HEADING_PATTERN = re.compile(
     r"^(chapter|chap|part|book|section|prologue|epilogue)\b[\w\s:.-]*$",
     re.IGNORECASE,
 )
+
+# ---------------------------------------------------------------------------
+# Heuristic Thresholds for Text Quality and Cleaning
+# ---------------------------------------------------------------------------
 MAX_HEADER_FOOTER_LINE_LENGTH = 100
 MIN_REPEAT_COUNT = 3
 MIN_REPEAT_RATIO = 0.25
 OCR_MIN_LENGTH_THRESHOLD = 160
 OCR_MIN_TOKEN_THRESHOLD = 30
+
+# ---------------------------------------------------------------------------
+# OCR Engine Configuration
+# ---------------------------------------------------------------------------
 OCR_RENDER_RESOLUTION = 300
 OCR_TESSERACT_CONFIG = "--oem 3 --psm 6"
 LIGATURE_REPLACEMENTS = {
@@ -36,38 +79,156 @@ LIGATURE_REPLACEMENTS = {
     "\ufb06": "st",
 }
 
-def save_pdf(file_bytes: bytes, filename: str) -> str:
-    PDF_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
+# ---------------------------------------------------------------------------
+# Ollama System Prompts
+# ---------------------------------------------------------------------------
+_QUALITY_SYSTEM_PROMPT = (
+    "You are a document quality evaluator. "
+    "Respond with JSON only, no extra text, no markdown: "
+    "{\"weak\": true/false, \"reason\": \"brief reason\"}"
+)
 
+_HEADER_FOOTER_SYSTEM_PROMPT = (
+    "You classify document lines. "
+    "Respond with JSON only, no extra text, no markdown: "
+    "{\"is_noise\": true/false}"
+)
+
+_OCR_REPAIR_SYSTEM_PROMPT = (
+    "You repair OCR-extracted text from books and documents. "
+    "Fix broken words, ligature errors, misread characters, and spacing issues. "
+    "Preserve the original meaning and structure exactly. "
+    "Return only the repaired text, no explanations, no extra commentary."
+)
+
+
+# ===========================================================================
+# Ollama Client
+# ===========================================================================
+
+def ollama_generate(prompt: str, model: str = None, system: str = "") -> str:
+    """
+    Calls the Ollama /api/generate endpoint synchronously.
+
+    Args:
+        prompt: The user prompt to send.
+        model:  Ollama model tag to use (e.g. "mistral", "phi3", "llama3.1:8b").
+        system: Optional system prompt to set model behaviour.
+
+    Returns:
+        The model's response string, or "" on any failure.
+    """
+    if not OLLAMA_ENABLED:
+        return ""
+
+    if model is None:
+        model = OLLAMA_DEFAULT_MODEL
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+    }
+    if system:
+        payload["system"] = system
+
+    try:
+        response = httpx.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            # stream=False ensures we wait for the full response before proceeding
+            json=payload,
+            timeout=OLLAMA_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json().get("response", "").strip()
+    except httpx.HTTPError as exc:
+        logger.warning("Ollama HTTP request failed (model=%s): %s", model, exc)
+    except Exception as exc:
+        logger.warning("Unexpected Ollama error (model=%s): %s", model, exc)
+    return ""
+
+
+def _safe_parse_json(raw: str, fallback: dict) -> dict:
+    """
+    Attempts to parse a JSON string returned by Ollama.
+    Strips markdown fences if present and returns fallback on failure.
+    """
+    cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
+    try:
+        return json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        logger.debug("Failed to parse Ollama JSON response: %r", raw)
+        return fallback
+
+
+# ===========================================================================
+# File Management
+# ===========================================================================
+
+def save_pdf(file_bytes: bytes, filename: str) -> str:
+    """
+    Saves a PDF file to the local storage with a unique filename.
+
+    Args:
+        file_bytes: The raw binary data of the PDF.
+        filename:   The original name of the file.
+
+    Returns:
+        The absolute string path to the saved file.
+    """
+    PDF_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
     unique_name = f"{uuid.uuid4()}_{filename}"
     file_path = PDF_STORAGE_PATH / unique_name
-
+    # Atomic write of the binary data to the local filesystem
     file_path.write_bytes(file_bytes)
-
     return str(file_path)
 
 
-def extract_text_by_page(pdf_path: str):
-    pages = []
-    header_counts = Counter()
-    footer_counts = Counter()
+# ===========================================================================
+# Main Extraction Pipeline
+# ===========================================================================
+
+def extract_text_by_page(pdf_path: str) -> list[dict]:
+    """
+    Main entry point for text extraction.  Iterates through pages, scores
+    content, performs OCR if needed, repairs OCR output with Ollama, and
+    removes running headers/footers.
+
+    Args:
+        pdf_path: Path to the PDF file.
+
+    Returns:
+        A list of dicts with keys:
+            page_number     – 1-based page index
+            text            – cleaned, readable text
+            weak_text       – bool; True if text quality is still suspect
+            extraction_meta – dict with source, score, ocr_applied flags
+    """
+    pages: list[dict] = []
+    header_counts: Counter = Counter()
+    footer_counts: Counter = Counter()
     pypdf_pages: list[Any] = []
 
+    # Attempt to load with pypdf to provide an alternative extraction source
     try:
         from pypdf import PdfReader  # type: ignore
-
         reader = PdfReader(pdf_path)
         pypdf_pages = list(reader.pages)
     except Exception as exc:
         logger.debug("pypdf unavailable for %s: %s", pdf_path, exc)
 
+    # ------------------------------------------------------------------
+    # Phase 1: Initial extraction and header/footer candidate collection
+    # ------------------------------------------------------------------
     with pdfplumber.open(pdf_path) as pdf:
         for i, page in enumerate(pdf.pages):
             pypdf_page = pypdf_pages[i] if i < len(pypdf_pages) else None
             raw_text, extraction_meta = _extract_page_text(page, pypdf_page=pypdf_page)
+            # Break text into lines to identify repeating structural elements
             lines = _split_lines(raw_text)
 
             if lines:
+                # Track top/bottom lines across the whole book to find common headers/footers
                 for line in lines[:2]:
                     header_counts[_normalize_running_line(line)] += 1
                 for line in lines[-2:]:
@@ -80,36 +241,43 @@ def extract_text_by_page(pdf_path: str):
                 "extraction_meta": extraction_meta,
             })
 
-    header_candidates = _select_header_footer_candidates(
-        header_counts,
-        len(pages),
-    )
-    footer_candidates = _select_header_footer_candidates(
-        footer_counts,
-        len(pages),
-    )
+    # Identify lines that appear frequently enough to be considered noise
+    header_candidates = _select_header_footer_candidates(header_counts, len(pages))
+    footer_candidates = _select_header_footer_candidates(footer_counts, len(pages))
 
-    cleaned_pages = []
+    # ------------------------------------------------------------------
+    # Phase 2: Clean text by removing identified noise
+    # ------------------------------------------------------------------
+    cleaned_pages: list[dict] = []
     for page in pages:
+        # Remove identified headers, footers, and page markers
         filtered_lines = _filter_page_lines(
             page["lines"],
             header_candidates,
-            footer_candidates
+            footer_candidates,
         )
 
+        # Fallback: if filtering removed everything, keep original lines
         if not filtered_lines and page["lines"]:
             filtered_lines = page["lines"]
 
         cleaned_text = (
+            # Handles line merging and de-hyphenation
             _reconstruct_text(filtered_lines)
             if filtered_lines
             else _normalize_text(page["raw_text"])
         )
-        # Page-number-only scraps should not be treated as narrative text downstream.
+
+        # Discard pages that contain only numbers or roman numerals
         if _is_page_marker_only_text(cleaned_text):
             cleaned_text = ""
 
-        weak_text = _is_weak_page_text(cleaned_text)
+        # Heuristic quality check first (fast)
+        heuristic_weak = _is_weak_page_text(cleaned_text)
+
+        # LLM quality check on borderline pages (slower but smarter)
+        weak_text = _is_weak_page_text_llm(cleaned_text, heuristic_weak)
+
         cleaned_pages.append({
             "page_number": page["page_number"],
             "text": cleaned_text,
@@ -120,13 +288,24 @@ def extract_text_by_page(pdf_path: str):
     return cleaned_pages
 
 
-def _extract_page_text(page, pypdf_page=None):
+# ===========================================================================
+# Page-Level Extraction
+# ===========================================================================
+
+def _extract_page_text(page, pypdf_page=None) -> tuple[str, dict]:
+    """
+    Evaluates multiple extraction methods for a single page and chooses the
+    best result.  Triggers OCR if digital extraction is poor, and then runs
+    Ollama-based repair if OCR wins.
+    """
     candidates: list[tuple[str, str]] = []
 
+    # Method 1: Extraction with layout preservation
     plumber_layout = page.extract_text(layout=True, x_tolerance=1, y_tolerance=1)
     if plumber_layout:
         candidates.append(("plumber_layout", plumber_layout))
 
+    # Method 2: Standard plain text extraction
     plumber_plain = page.extract_text(x_tolerance=1, y_tolerance=1)
     if plumber_plain:
         candidates.append(("plumber_plain", plumber_plain))
@@ -139,37 +318,58 @@ def _extract_page_text(page, pypdf_page=None):
         except Exception as exc:
             logger.debug("pypdf extraction failed for page: %s", exc)
 
+    # Final fallback for digital extraction: extract individual words
     if not candidates:
         words = page.extract_words(use_text_flow=True)
-        candidates.append(("plumber_words", " ".join(word["text"] for word in words)))
+        candidates.append(("plumber_words", " ".join(w["text"] for w in words)))
 
+    # Select the best digital version based on heuristic scoring
     text, source, score = _pick_best_text_candidate(candidates)
+
     ocr_applied = False
     ocr_improved = False
+    ocr_repaired = False
     final_score = score
+
+    # If the best digital text is still unreadable/short, attempt OCR
     if _should_try_ocr(text):
         ocr_applied = True
         ocr_text = _extract_page_text_with_ocr(page)
         ocr_score = _extraction_score(ocr_text)
+
         if ocr_score > score:
             ocr_improved = True
             final_score = ocr_score
             source = "ocr"
+
+            # Ollama post-processing: repair common OCR artefacts
+            repaired = _repair_ocr_text(ocr_text)
+            if repaired and repaired != ocr_text:
+                ocr_repaired = True
+                ocr_text = repaired
+
             return ocr_text, {
                 "source": source,
                 "score": round(final_score, 2),
                 "ocr_applied": ocr_applied,
                 "ocr_improved": ocr_improved,
+                "ocr_repaired": ocr_repaired,
             }
+
     return text, {
         "source": source,
         "score": round(final_score, 2),
         "ocr_applied": ocr_applied,
         "ocr_improved": ocr_improved,
+        "ocr_repaired": ocr_repaired,
     }
 
 
 def _pick_best_text_candidate(candidates: list[tuple[str, str]]) -> tuple[str, str, float]:
+    """
+    Iterates through extraction sources and selects the one with the highest
+    quality score.
+    """
     best_text = ""
     best_source = "unknown"
     best_score = float("-inf")
@@ -183,27 +383,33 @@ def _pick_best_text_candidate(candidates: list[tuple[str, str]]) -> tuple[str, s
     return best_text, best_source, best_score
 
 
-def _extract_page_text_with_ocr(page) -> str:
-    try:
-        import pytesseract  # type: ignore
-    except Exception:
-        return ""
+# ===========================================================================
+# OCR
+# ===========================================================================
 
+def _extract_page_text_with_ocr(page) -> str:
+    """
+    Renders the PDF page as an image and runs Tesseract OCR.
+    """
     try:
         page_image = page.to_image(resolution=OCR_RENDER_RESOLUTION).original
     except Exception as exc:
-        logger.debug("OCR render failed for page: %s", exc)
+        logger.warning("OCR render (pdf-to-image) failed: %s", exc)
         return ""
 
     try:
         text = pytesseract.image_to_string(page_image, config=OCR_TESSERACT_CONFIG)
         return text or ""
     except Exception as exc:
-        logger.debug("OCR text extraction failed for page: %s", exc)
+        logger.error("Tesseract OCR binary failed or not in PATH: %s", exc)
         return ""
 
 
 def _should_try_ocr(text: str) -> bool:
+    """
+    Determines if a page is a candidate for OCR based on text density,
+    alphabetic ratio, and symbol density.
+    """
     normalized = _normalize_text(text)
     if not normalized:
         return True
@@ -214,16 +420,140 @@ def _should_try_ocr(text: str) -> bool:
     if len(tokens) < OCR_MIN_TOKEN_THRESHOLD:
         return True
 
-    alpha_tokens = sum(1 for token in tokens if re.search(r"[A-Za-z]{2,}", token))
+    alpha_tokens = sum(1 for t in tokens if re.search(r"[A-Za-z]{2,}", t))
     alpha_ratio = alpha_tokens / max(len(tokens), 1)
-    symbol_ratio = len(re.findall(r"[^A-Za-z0-9\s.,;:!?'\-\"()\[\]]", normalized)) / max(len(normalized), 1)
+    symbol_ratio = (
+        len(re.findall(r"[^A-Za-z0-9\s.,;:!?'\-\"()\[\]]", normalized))
+        / max(len(normalized), 1)
+    )
     if alpha_ratio < 0.45:
         return True
-    # Heuristic for noisy/scanned pages with many symbols and sparse readable words.
     return symbol_ratio > 0.08 and alpha_ratio < 0.6
 
 
+# ===========================================================================
+# Ollama-Powered Enhancements
+# ===========================================================================
+
+def _repair_ocr_text(text: str) -> str:
+    """
+    Uses Ollama to fix common OCR artefacts: broken words, missed spaces,
+    misread characters, and residual ligature noise.
+
+    Only called when OCR was the winning extraction source.
+    Processes text in sentence-aware chunks to stay within context limits.
+    Falls back silently to the original text on any failure.
+
+    Args:
+        text: Raw OCR-extracted text for one page.
+
+    Returns:
+        Repaired text string, or the original if repair failed / was skipped.
+    """
+    if not OLLAMA_ENABLED or not text or len(text) < 50:
+        return text
+
+    # Break page text into chunks to prevent hitting LLM context limits
+    chunks = _chunk_text_for_llm(text, max_chars=1200)
+    repaired_chunks: list[str] = []
+
+    for chunk in chunks:
+        prompt = f"Repair this OCR-extracted text:\n\n{chunk}"
+        result = ollama_generate(prompt, model=OLLAMA_DEFAULT_MODEL, system=_OCR_REPAIR_SYSTEM_PROMPT)
+        repaired_chunks.append(result if result else chunk)
+
+    return " ".join(repaired_chunks)
+
+
+def _is_weak_page_text_llm(text: str, heuristic_weak: bool) -> bool:
+    """
+    Uses Ollama to verify whether extracted page text is genuinely unreadable.
+
+    Strategy:
+      - If the fast heuristic says text is GOOD (heuristic_weak=False),
+        trust it and skip the LLM call entirely.
+      - If the heuristic says text is WEAK, ask Ollama for a second opinion
+        to avoid false positives on technical/foreign-language content.
+
+    Args:
+        text:             Cleaned page text.
+        heuristic_weak:   Result of the regex-based _is_weak_page_text().
+
+    Returns:
+        True if the page text is considered low quality, False otherwise.
+    """
+    if not OLLAMA_ENABLED:
+        return heuristic_weak
+
+    # Heuristic is confident the text is fine — no need to call LLM
+    if not heuristic_weak:
+        return False
+
+    if not text or len(text) < 80:
+        return True
+
+    # Send a sample of the text to the LLM for a readability second-opinion
+    sample = text[:600]
+    prompt = (
+        "Is the following extracted PDF text garbled, mostly symbols, "
+        "or unreadable gibberish? Evaluate overall readability.\n\n"
+        f"Text:\n{sample}"
+    )
+    raw = ollama_generate(prompt, model=OLLAMA_DEFAULT_MODEL, system=_QUALITY_SYSTEM_PROMPT)
+    result = _safe_parse_json(raw, fallback={"weak": heuristic_weak})
+    return bool(result.get("weak", heuristic_weak))
+
+
+@lru_cache(maxsize=512)
+def _is_likely_running_header_footer_llm(line: str) -> bool:
+    """
+    LLM-backed classifier for header/footer noise detection.
+
+    Uses an LRU cache (size 512) so repeated lines across hundreds of pages
+    only trigger a single Ollama call.
+
+    Falls back to regex heuristic if Ollama is disabled or returns garbage.
+
+    Args:
+        line: A single line of text from a page.
+
+    Returns:
+        True if the line appears to be structural noise (header/footer/page number).
+    """
+    if not OLLAMA_ENABLED:
+        return _is_likely_running_header_footer(line)
+
+    # Fast-path: let obvious cases bypass the LLM
+    if _looks_like_page_marker(line):
+        return True
+    if len(line) > MAX_HEADER_FOOTER_LINE_LENGTH:
+        return False
+
+    prompt = (
+        f"Is this line a running page header, footer, page number, copyright notice, "
+        f"or other structural/navigational noise in a book or document? "
+        f"It should NOT be actual prose or meaningful content.\n\n"
+        f"Line: \"{line}\""
+    )
+    raw = ollama_generate(prompt, model=OLLAMA_FAST_MODEL, system=_HEADER_FOOTER_SYSTEM_PROMPT)
+    result = _safe_parse_json(raw, fallback={"is_noise": None})
+
+    # If LLM gave no clear answer, fall back to regex heuristic
+    if result.get("is_noise") is None:
+        return _is_likely_running_header_footer(line)
+
+    return bool(result["is_noise"])
+
+
+# ===========================================================================
+# Scoring
+# ===========================================================================
+
 def _extraction_score(text: str) -> float:
+    """
+    A heuristic scoring function. Rewards word count and readability.
+    Penalises single-letter tokens, weird spacing, and broken hyphens.
+    """
     if not text:
         return 0.0
     normalized = _normalize_text(text)
@@ -231,11 +561,15 @@ def _extraction_score(text: str) -> float:
         return 0.0
 
     tokens = normalized.split()
-    alpha_tokens = sum(1 for token in tokens if re.search(r"[A-Za-z]{2,}", token))
+    alpha_tokens = sum(1 for t in tokens if re.search(r"[A-Za-z]{2,}", t))
     words = re.findall(r"[A-Za-z]{2,}", normalized)
     bad_chars = len(re.findall(r"[^A-Za-z0-9\s.,;:!?'\-\"()\[\]]", normalized))
     bad_ratio = bad_chars / max(len(normalized), 1)
-    single_letter_ratio = sum(1 for token in tokens if len(token) == 1 and token.isalpha()) / max(len(tokens), 1)
+    single_letter_ratio = (
+        sum(1 for t in tokens if len(t) == 1 and t.isalpha())
+        / max(len(tokens), 1)
+    )
+    # Detect gaps like "t h i s" or "i n t e r- esting"
     weird_spacing_penalty = len(re.findall(r"\b[A-Za-z]\s+[A-Za-z]\b", normalized))
     broken_hyphen_penalty = len(re.findall(r"\w+-\s+\w", normalized))
 
@@ -250,28 +584,44 @@ def _extraction_score(text: str) -> float:
     )
 
 
+# ===========================================================================
+# Line / Text Utilities
+# ===========================================================================
+
 def _split_lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 def _select_header_footer_candidates(counter: Counter, total_pages: int) -> set[str]:
+    """
+    Filters a counter of lines to find those appearing frequently enough to be
+    considered headers or footers.
+    """
     threshold = max(MIN_REPEAT_COUNT, int(total_pages * MIN_REPEAT_RATIO))
     return {
-        line for line, count in counter.items()
-        if count >= threshold and _is_likely_running_header_footer(line)
+        line
+        for line, count in counter.items()
+        if count >= threshold and _is_likely_running_header_footer_llm(line)
     }
 
 
 def _normalize_running_line(line: str) -> str:
+    """
+    Normalises a line for header/footer comparison by replacing page numbers
+    with a placeholder so "Page 1" and "Page 2" map to the same signature.
+    """
     normalized = line.lower().strip()
     normalized = re.sub(r"\s+", " ", normalized)
-    # Make "page 1" and "page 2" map to the same signature.
     normalized = re.sub(r"\b\d+\b", "#", normalized)
     normalized = re.sub(r"\b[ivxlcdm]+\b", "#", normalized)
     return normalized
 
 
 def _is_likely_running_header_footer(line: str) -> bool:
+    """
+    Regex-only fallback: applies heuristics to check if a line looks like
+    structural noise (metadata). Used when Ollama is disabled or unavailable.
+    """
     normalized = line.strip()
     if not normalized:
         return False
@@ -284,13 +634,14 @@ def _is_likely_running_header_footer(line: str) -> bool:
     words = normalized.split()
     if 1 <= len(words) <= 12 and normalized == normalized.upper():
         return True
-    # Likely running headers/footers such as "Book Title | Author Name".
+    # Likely running headers such as "Book Title | Author Name"
     if 1 <= len(words) <= 10 and re.search(r"[|/:-]", normalized):
         return True
     return False
 
 
 def _looks_like_page_marker(line: str) -> bool:
+    """Checks if a line is just a page number or roman numeral."""
     stripped = line.strip().lower()
     if not stripped:
         return False
@@ -303,7 +654,15 @@ def _looks_like_page_marker(line: str) -> bool:
     return False
 
 
-def _filter_page_lines(lines: list[str], headers: set[str], footers: set[str]) -> list[str]:
+def _filter_page_lines(
+    lines: list[str],
+    headers: set[str],
+    footers: set[str],
+) -> list[str]:
+    """
+    Removes matching headers/footers from the start and end of the page lines
+    list, and filters out standalone page numbers from the middle.
+    """
     filtered = list(lines)
 
     while filtered and _normalize_running_line(filtered[0]) in headers:
@@ -311,8 +670,8 @@ def _filter_page_lines(lines: list[str], headers: set[str], footers: set[str]) -
     while filtered and _normalize_running_line(filtered[-1]) in footers:
         filtered.pop()
 
-    cleaned = []
-    for index, line in enumerate(filtered):
+    cleaned: list[str] = []
+    for line in filtered:
         if _looks_like_page_marker(line):
             continue
         if len(line.split()) <= 1 and line.strip().isdigit():
@@ -323,6 +682,10 @@ def _filter_page_lines(lines: list[str], headers: set[str], footers: set[str]) -
 
 
 def _reconstruct_text(lines: list[str]) -> str:
+    """
+    Joins lines back into a single string, handling de-hyphenation at line
+    endings when the next line continues the word.
+    """
     if not lines:
         return ""
 
@@ -347,6 +710,10 @@ def _reconstruct_text(lines: list[str]) -> str:
 
 
 def _normalize_text(text: str) -> str:
+    """
+    Final cleanup: fixes ligatures, collapses whitespace, removes trailing
+    hyphens, and handles punctuation spacing.
+    """
     if not text:
         return ""
 
@@ -354,16 +721,21 @@ def _normalize_text(text: str) -> str:
     for source, target in LIGATURE_REPLACEMENTS.items():
         cleaned = cleaned.replace(source, target)
     cleaned = re.sub(r"\s+", " ", cleaned)
+    # Fix words split by line breaks: "inter- esting" -> "interesting"
     cleaned = re.sub(r"(?<=\w)-\s+(?=\w)", "", cleaned)
+    # Remove space before punctuation
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    # Normalise bracket spacing
     cleaned = re.sub(r"([(\[{])\s+", r"\1", cleaned)
     cleaned = re.sub(r"\s+([)\]}])", r"\1", cleaned)
+    # Heuristic: add space between lowercase and uppercase if stuck (OCR error)
     cleaned = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", cleaned)
 
     return cleaned
 
 
 def _is_page_marker_only_text(text: str) -> bool:
+    """Checks if the entire text content is just page numbers/roman numerals."""
     if not text:
         return False
     lines = _split_lines(text)
@@ -373,6 +745,10 @@ def _is_page_marker_only_text(text: str) -> bool:
 
 
 def _is_weak_page_text(text: str) -> bool:
+    """
+    Heuristic-only check. Evaluates if final cleaned text appears to be low
+    quality. Called first; result is passed to _is_weak_page_text_llm().
+    """
     normalized = _normalize_text(text)
     if not normalized:
         return True
@@ -381,10 +757,34 @@ def _is_weak_page_text(text: str) -> bool:
         return True
     if len(tokens) < OCR_MIN_TOKEN_THRESHOLD:
         return True
-    alpha_tokens = sum(1 for token in tokens if re.search(r"[A-Za-z]{2,}", token))
+    alpha_tokens = sum(1 for t in tokens if re.search(r"[A-Za-z]{2,}", t))
     alpha_ratio = alpha_tokens / max(len(tokens), 1)
     single_letter_ratio = (
-        sum(1 for token in tokens if len(token) == 1 and token.isalpha())
+        sum(1 for t in tokens if len(t) == 1 and t.isalpha())
         / max(len(tokens), 1)
     )
     return alpha_ratio < 0.45 or single_letter_ratio > 0.22
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+def _chunk_text_for_llm(text: str, max_chars: int = 1200) -> list[str]:
+    """
+    Splits text into sentence-aware chunks for LLM processing, ensuring each
+    chunk stays within the max_chars budget.
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    chunks: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if len(current) + len(sentence) > max_chars:
+            if current:
+                chunks.append(current.strip())
+            current = sentence
+        else:
+            current += " " + sentence
+    if current:
+        chunks.append(current.strip())
+    return chunks

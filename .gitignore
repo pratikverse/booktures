@@ -1,36 +1,47 @@
-# Python
-__pycache__/
-*.pyc
-.env
-
-# Conda
-*.conda
-*.env
-env/
-venv/
-# FastAPI
-storage/
-*.sqlite3
-# ML / Images
-*.png
-*.jpg
-*.jpeg
-# PDFs
-*.pdf
-# Node
-node_modules/
-dist/
-# OS
+# Root ignores (applies to backend + frontend)
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
-# DB
-*.db
-*.yml
-*.vscode/
-*.pdf
-*.pptx
-*.docx
-*.db-wal
-*.db-shm
-*.txt 
-*.md
+
+# Python
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+*.py[cod]
+*$py.class
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+env/
+ENV/
+
+# Node / frontend
+**/node_modules/
+**/.vite/
+coverage/
+dist/
+dist-ssr/
+
+# Build artifacts
+build/
+*.egg-info/
+
+# Runtime logs
+*.log
+*.pid
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Markdown docs
+
+
+# App generated storage
+backend/storage/
+

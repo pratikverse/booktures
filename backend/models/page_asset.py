@@ -1,30 +1,20 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, func
-
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime
+from sqlalchemy.sql import func
 from database import Base
 
-
 class PageAsset(Base):
+    """
+    Stores the narrative summaries and generated visual metadata for each page.
+    """
     __tablename__ = "page_assets"
 
     id = Column(Integer, primary_key=True, index=True)
-    book_id = Column(Integer, ForeignKey("books.id"), index=True, nullable=False)
-    page_id = Column(Integer, ForeignKey("pages.id"), unique=True, index=True, nullable=False)
-    page_number = Column(Integer, index=True, nullable=False)
-    scene_summary = Column(Text, nullable=True)
-    summary_short = Column(Text, nullable=True)
-    continuity_summary = Column(Text, nullable=True)
-    visual_prompt = Column(Text, nullable=True)
-    prompt_override = Column(Text, nullable=True)
-    last_used_prompt = Column(Text, nullable=True)
-    negative_prompt = Column(Text, nullable=True)
-    style_preset = Column(String, nullable=False, default="storybook")
-    image_path = Column(Text, nullable=True)
-    image_model_used = Column(String, nullable=True)
-    image_preset_used = Column(String, nullable=True)
-    image_seed = Column(Integer, nullable=True)
-    image_status = Column(String, nullable=False, default="pending")
-    last_error = Column(Text, nullable=True)
-    prompt_generated_at = Column(DateTime, nullable=True)
-    image_generated_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+    chunk_id = Column(Integer, ForeignKey("document_chunks.id", ondelete="CASCADE"), unique=True)
+    
+    visual_summary = Column(Text) # The condensed narrative for the LLM
+    key_objects = Column(Text) # Comma-separated list of identified visual assets
+    image_prompt = Column(Text) # The final prompt sent to Stable Diffusion
+    image_path = Column(String) # Path to the generated illustration
+    seed = Column(Integer) # The deterministic seed used for this generation
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

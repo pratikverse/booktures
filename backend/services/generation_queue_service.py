@@ -1,551 +1,182 @@
-import json
-import logging
-import os
 import threading
 import time
-from datetime import datetime, timedelta
-from typing import Optional
-
 from database import SessionLocal
-from models.generation_job import GenerationJob
-from models.page import Page
-from services.character_service import build_character_registry
-from services.image_generation_service import generate_page_image
-from services.prompt_service import build_page_visual_prompt, DEFAULT_STYLE_PRESET
+from models import Job, Book, DocumentChunk, Character, PageAsset
+from services import pdf_service
+from services import character_service
+from services import prompt_service
+from services.image_generation_service import image_service # Renamed from illustration_service
+import logging
 
 logger = logging.getLogger(__name__)
 
-JOB_BOOK_PIPELINE = "book_pipeline"
-JOB_PAGE_IMAGE = "page_image"
-JOB_BOOK_IMAGES = "book_images"
+class GenerationWorker(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.running = True
 
-JOB_STATUS_QUEUED = "queued"
-JOB_STATUS_RUNNING = "running"
-JOB_STATUS_PAUSED = "paused"
-JOB_STATUS_CANCELED = "canceled"
-JOB_STATUS_COMPLETED = "completed"
-JOB_STATUS_FAILED = "failed"
+    def run(self):
+        while self.running:
+            db = SessionLocal()
+            try:
+                # Claim the oldest queued job
+                job = db.query(Job).filter(Job.status == "queued").order_by(Job.created_at).first()
+                
+                if job:
+                    job.status = "running"
+                    db.commit()
+                    
+                    self._execute_job(job, db)
+                    
+                db.close()
+            except Exception as e:
+                logger.error(f"Worker Error: {e}")
+            
+            time.sleep(5) # Poll every 5 seconds
 
-_worker_thread: Optional[threading.Thread] = None
-_worker_stop_event = threading.Event()
-_worker_lock = threading.Lock()
+    def _execute_job(self, job, db):
+        try:
+            if job.job_type == "book_pipeline":
+                self._run_analysis_pipeline(job, db)
+            elif job.job_type == "image_generation":
+                self._run_image_pipeline(job, db)
+            else:
+                raise Exception(f"Unknown job type: {job.job_type}")
+        except Exception as e:
+            logger.error(f"Job failed: {e}")
+            job.status = "failed"
+            job.status_note = str(e)
+            book = db.query(Book).filter(Book.id == job.book_id).first()
+            if book:
+                book.status = "failed"
+                book.progress = 0.0
+            db.commit()
 
+    def _run_analysis_pipeline(self, job, db):
+        book = db.query(Book).filter(Book.id == job.book_id).first()
+        if not book:
+            raise Exception("Book not found")
 
-class JobPaused(Exception):
-    pass
+        job.status_note = "Extracting text from PDF..."
+        book.status = "processing"
+        job.progress = 0.05
+        book.progress = 0.05
+        db.commit()
+        
+        pages = pdf_service.extract_text_by_page(book.file_path)
+        chunks = []
+        for page in pages:
+            chunk = DocumentChunk(book_id=book.id, page_number=page["page_number"], content=page["text"])
+            db.add(chunk)
+            chunks.append(chunk)
+        db.commit()
 
+        job.status_note = "Building Character Visual Bible..."
+        job.progress = 0.2
+        book.progress = 0.2
+        db.commit()
+        character_service.process_book_characters(book.id, db)
+        characters = db.query(Character).filter(Character.book_id == book.id).all()
+        visual_bible = "\n".join([f"- {c.name}: {c.visual_profile}" for c in characters]) or "No characters identified."
 
-class JobCanceled(Exception):
-    pass
+        for i, chunk in enumerate(chunks):
+            # Check for cancellation or pause status
+            db.refresh(job)
+            if job.status == "cancelled":
+                logger.info(f"Aborting Job {job.id}: User cancelled.")
+                return
+            
+            while job.status == "paused":
+                time.sleep(2)
+                db.refresh(job)
+                if job.status == "cancelled":
+                    return
 
+            job.progress = 0.2 + (0.8 * (i / len(chunks)))
+            book.progress = job.progress
+            job.status_note = f"Analyzing page {chunk.page_number}/{len(chunks)}..."
+            db.commit()
+            
+            prev_page_assets = db.query(PageAsset).join(DocumentChunk).filter(
+                DocumentChunk.book_id == book.id, DocumentChunk.page_number < chunk.page_number
+            ).order_by(DocumentChunk.page_number.desc()).limit(3).all()
+            previous_summaries_text = " ".join([pa.visual_summary for pa in prev_page_assets])
+
+            page_summary = prompt_service.generate_page_summary(chunk.content, previous_summaries_text)
+            page_metadata = character_service.extract_page_metadata(chunk.content)
+            image_prompt = prompt_service.generate_illustration_prompt(page_summary, visual_bible, page_metadata.get("scene", ""))
+            
+            chunk.summary = page_summary
+            chunk.characters = page_metadata.get("characters")
+            chunk.scenes = page_metadata.get("scene")
+            db.add(chunk)
+
+            page_asset = PageAsset(
+                chunk_id=chunk.id, visual_summary=page_summary,
+                image_prompt=image_prompt, image_path=None, seed=chunk.id
+            )
+            db.add(page_asset)
+            db.commit()
+
+        job.status = "completed"
+        book.status = "analyzed"
+        book.progress = 1.0
+        db.commit()
+
+    def _run_image_pipeline(self, job, db):
+        book = db.query(Book).filter(Book.id == job.book_id).first()
+        if not book: raise Exception("Book not found")
+
+        job.status_note = "Starting image generation..."
+        book.status = "generating_images"
+        db.commit()
+
+        # Reconstruct the Visual Bible from stored characters for prompt context
+        characters = db.query(Character).filter(Character.book_id == book.id).all()
+        visual_bible = "\n".join([f"- {c.name}: {c.visual_profile}" for c in characters]) or "No characters identified."
+
+        assets = db.query(PageAsset).join(DocumentChunk).filter(DocumentChunk.book_id == book.id).all()
+        for i, asset in enumerate(assets):
+            # Check for cancellation or pause status
+            db.refresh(job)
+            if job.status == "cancelled":
+                logger.info(f"Aborting Image Generation Job {job.id}: User cancelled.")
+                return
+
+            while job.status == "paused":
+                time.sleep(2)
+                db.refresh(job)
+                if job.status == "cancelled":
+                    return
+
+            chunk = db.query(DocumentChunk).filter(DocumentChunk.id == asset.chunk_id).first()
+            job.progress = (i / len(assets))
+            book.progress = job.progress
+            job.status_note = f"Rendering illustration for page {chunk.page_number if chunk else '?'}/{len(assets)}..."
+            db.commit()
+
+            # Step 2a: Generate the prompt now if it hasn't been created or manually overridden
+            if not asset.image_prompt:
+                asset.image_prompt = prompt_service.generate_illustration_prompt(
+                    asset.visual_summary, 
+                    visual_bible, 
+                    chunk.scenes or ""
+                )
+            if not asset.image_path:
+                img_path = image_service.render_page_image(asset.image_prompt, book.id, chunk.page_number, asset.seed)
+                if img_path:
+                    asset.image_path = img_path
+                    chunk.illustration_path = img_path
+                    db.add(asset)
+                    db.add(chunk)
+                    db.commit()
+
+        job.status = "completed"
+        book.status = "completed"
+        book.progress = 1.0
+        db.commit()
 
 def start_worker():
-    global _worker_thread
-    with _worker_lock:
-        if _worker_thread and _worker_thread.is_alive():
-            return
-        _worker_stop_event.clear()
-        _worker_thread = threading.Thread(
-            target=_worker_loop,
-            name="booktures-job-worker",
-            daemon=True,
-        )
-        _worker_thread.start()
-        logger.info("Generation queue worker started")
-
-
-def stop_worker():
-    _worker_stop_event.set()
-
-
-def enqueue_job(
-    book_id: int,
-    job_type: str,
-    payload: dict | None = None,
-    page_id: Optional[int] = None,
-    max_attempts: int = 3,
-) -> int:
-    db = SessionLocal()
-    try:
-        job = GenerationJob(
-            book_id=book_id,
-            page_id=page_id,
-            job_type=job_type,
-            payload=json.dumps(payload or {}),
-            status=JOB_STATUS_QUEUED,
-            progress=0.0,
-            attempts=0,
-            max_attempts=max_attempts,
-            run_after=datetime.utcnow(),
-        )
-        db.add(job)
-        db.commit()
-        db.refresh(job)
-        return job.id
-    finally:
-        db.close()
-
-
-def enqueue_book_pipeline(
-    book_id: int,
-    style_preset: str = DEFAULT_STYLE_PRESET,
-    force_prompt_refresh: Optional[bool] = None,
-) -> int:
-    resolved_force_refresh = (
-        _read_env_bool("BOOKTURES_PIPELINE_FORCE_PROMPT_REFRESH", False)
-        if force_prompt_refresh is None
-        else bool(force_prompt_refresh)
-    )
-    return enqueue_job(
-        book_id=book_id,
-        job_type=JOB_BOOK_PIPELINE,
-        payload={
-            "style_preset": style_preset,
-            "force_prompt_refresh": resolved_force_refresh,
-        },
-        max_attempts=2,
-    )
-
-
-def enqueue_page_image(
-    book_id: int,
-    page_number: int,
-    style_preset: str = DEFAULT_STYLE_PRESET,
-    force_prompt_refresh: bool = False,
-    force_regenerate: bool = False,
-) -> int:
-    return enqueue_job(
-        book_id=book_id,
-        job_type=JOB_PAGE_IMAGE,
-        payload={
-            "page_number": page_number,
-            "style_preset": style_preset,
-            "force_prompt_refresh": force_prompt_refresh,
-            "force_regenerate": force_regenerate,
-        },
-        max_attempts=3,
-    )
-
-
-def enqueue_book_images(
-    book_id: int,
-    style_preset: str = DEFAULT_STYLE_PRESET,
-    force_prompt_refresh: bool = False,
-    force_regenerate: bool = False,
-) -> int:
-    return enqueue_job(
-        book_id=book_id,
-        job_type=JOB_BOOK_IMAGES,
-        payload={
-            "style_preset": style_preset,
-            "force_prompt_refresh": force_prompt_refresh,
-            "force_regenerate": force_regenerate,
-        },
-        max_attempts=2,
-    )
-
-
-def pause_job(job_id: int) -> Optional[dict]:
-    db = SessionLocal()
-    try:
-        job = db.get(GenerationJob, job_id)
-        if job is None:
-            return None
-
-        payload = _read_payload(job.payload)
-        now = datetime.utcnow()
-
-        if job.status == JOB_STATUS_QUEUED:
-            job.status = JOB_STATUS_PAUSED
-            job.run_after = None
-            payload.pop("pause_requested", None)
-            payload.pop("cancel_requested", None)
-        elif job.status == JOB_STATUS_RUNNING:
-            payload["pause_requested"] = True
-            payload.pop("cancel_requested", None)
-        elif job.status == JOB_STATUS_PAUSED:
-            return _serialize_job(job)
-        else:
-            raise ValueError(f"Cannot pause job in status '{job.status}'")
-
-        job.payload = json.dumps(payload)
-        job.updated_at = now
-        db.add(job)
-        db.commit()
-        db.refresh(job)
-        return _serialize_job(job)
-    finally:
-        db.close()
-
-
-def resume_job(job_id: int) -> Optional[dict]:
-    db = SessionLocal()
-    try:
-        job = db.get(GenerationJob, job_id)
-        if job is None:
-            return None
-        if job.status != JOB_STATUS_PAUSED:
-            raise ValueError(f"Cannot resume job in status '{job.status}'")
-
-        payload = _read_payload(job.payload)
-        payload.pop("pause_requested", None)
-        payload.pop("cancel_requested", None)
-
-        job.status = JOB_STATUS_QUEUED
-        job.run_after = datetime.utcnow()
-        job.completed_at = None
-        job.payload = json.dumps(payload)
-        job.updated_at = datetime.utcnow()
-        db.add(job)
-        db.commit()
-        db.refresh(job)
-        return _serialize_job(job)
-    finally:
-        db.close()
-
-
-def cancel_job(job_id: int) -> Optional[dict]:
-    db = SessionLocal()
-    try:
-        job = db.get(GenerationJob, job_id)
-        if job is None:
-            return None
-
-        payload = _read_payload(job.payload)
-        now = datetime.utcnow()
-
-        if job.status in {JOB_STATUS_QUEUED, JOB_STATUS_PAUSED}:
-            job.status = JOB_STATUS_CANCELED
-            job.run_after = None
-            job.completed_at = now
-            payload.pop("pause_requested", None)
-            payload.pop("cancel_requested", None)
-        elif job.status == JOB_STATUS_RUNNING:
-            payload["cancel_requested"] = True
-            payload.pop("pause_requested", None)
-        elif job.status == JOB_STATUS_CANCELED:
-            return _serialize_job(job)
-        else:
-            raise ValueError(f"Cannot cancel job in status '{job.status}'")
-
-        job.payload = json.dumps(payload)
-        job.updated_at = now
-        db.add(job)
-        db.commit()
-        db.refresh(job)
-        return _serialize_job(job)
-    finally:
-        db.close()
-
-
-def _worker_loop():
-    while not _worker_stop_event.is_set():
-        job = _claim_next_job()
-        if job is None:
-            time.sleep(1.0)
-            continue
-        _run_job(job.id)
-
-
-def _claim_next_job() -> Optional[GenerationJob]:
-    db = SessionLocal()
-    try:
-        now = datetime.utcnow()
-        job = (
-            db.query(GenerationJob)
-            .filter(GenerationJob.status == JOB_STATUS_QUEUED)
-            .filter((GenerationJob.run_after.is_(None)) | (GenerationJob.run_after <= now))
-            .order_by(GenerationJob.created_at.asc())
-            .first()
-        )
-        if job is None:
-            return None
-        job.status = JOB_STATUS_RUNNING
-        if job.started_at is None:
-            job.started_at = now
-        job.updated_at = now
-        db.add(job)
-        db.commit()
-        db.refresh(job)
-        return job
-    finally:
-        db.close()
-
-
-def _run_job(job_id: int):
-    job: Optional[GenerationJob] = None
-    payload: dict = {}
-    try:
-        db = SessionLocal()
-        try:
-            job = db.get(GenerationJob, job_id)
-            if job is None:
-                return
-            payload = _read_payload(job.payload)
-            book_id = job.book_id
-            page_id = job.page_id
-            job_type = job.job_type
-        finally:
-            db.close()
-
-        # Run long work outside of any open job-tracking transaction.
-        temp_job = GenerationJob(id=job_id, book_id=book_id, page_id=page_id, job_type=job_type)
-        _check_job_control(job_id)
-        result = _dispatch_job(temp_job, payload)
-
-        db = SessionLocal()
-        try:
-            job = db.get(GenerationJob, job_id)
-            if job is None:
-                return
-            if job.status in {JOB_STATUS_PAUSED, JOB_STATUS_CANCELED}:
-                return
-            job.status = JOB_STATUS_COMPLETED
-            job.progress = 1.0
-            job.result = json.dumps(result)
-            job.completed_at = datetime.utcnow()
-            job.last_error = None
-            db.add(job)
-            db.commit()
-        finally:
-            db.close()
-    except JobPaused:
-        _mark_job_paused(job_id)
-    except JobCanceled:
-        _mark_job_canceled(job_id)
-    except Exception as exc:
-        _mark_job_failure(job_id, str(exc))
-
-
-def _dispatch_job(job: GenerationJob, payload: dict) -> dict:
-    if job.job_type == JOB_BOOK_PIPELINE:
-        style_preset = payload.get("style_preset", DEFAULT_STYLE_PRESET)
-        force_prompt_refresh = bool(payload.get("force_prompt_refresh", False))
-        _update_job_progress(job.id, 0.05, "building_character_registry")
-        build_character_registry(job.book_id)
-        _check_job_control(job.id)
-        _update_job_progress(job.id, 0.35, "caching_page_prompts")
-
-        db = SessionLocal()
-        try:
-            pages = (
-                db.query(Page)
-                .filter(Page.book_id == job.book_id)
-                .order_by(Page.page_number.asc())
-                .all()
-            )
-        finally:
-            db.close()
-
-        total = max(len(pages), 1)
-        for idx, page in enumerate(pages, start=1):
-            _check_job_control(job.id)
-            build_page_visual_prompt(
-                book_id=job.book_id,
-                page_number=page.page_number,
-                style_preset=style_preset,
-                force_refresh=force_prompt_refresh,
-            )
-            progress = 0.35 + (0.6 * (idx / total))
-            _update_job_progress(job.id, progress, f"prompt_cached_page_{page.page_number}")
-            _check_job_control(job.id)
-        return {"book_id": job.book_id, "pages_processed": len(pages)}
-
-    if job.job_type == JOB_PAGE_IMAGE:
-        _check_job_control(job.id)
-        page_number = int(payload["page_number"])
-        style_preset = payload.get("style_preset", DEFAULT_STYLE_PRESET)
-        result = generate_page_image(
-            book_id=job.book_id,
-            page_number=page_number,
-            style_preset=style_preset,
-            force_prompt_refresh=bool(payload.get("force_prompt_refresh", False)),
-            force_regenerate=bool(payload.get("force_regenerate", False)),
-        )
-        _check_job_control(job.id)
-        return result
-
-    if job.job_type == JOB_BOOK_IMAGES:
-        style_preset = payload.get("style_preset", DEFAULT_STYLE_PRESET)
-        force_prompt_refresh = bool(payload.get("force_prompt_refresh", False))
-        force_regenerate = bool(payload.get("force_regenerate", False))
-        db = SessionLocal()
-        try:
-            pages = (
-                db.query(Page)
-                .filter(Page.book_id == job.book_id)
-                .order_by(Page.page_number.asc())
-                .all()
-            )
-        finally:
-            db.close()
-
-        total = max(len(pages), 1)
-        generated = 0
-        failed = 0
-        for idx, page in enumerate(pages, start=1):
-            _check_job_control(job.id)
-            result = generate_page_image(
-                book_id=job.book_id,
-                page_number=page.page_number,
-                style_preset=style_preset,
-                force_prompt_refresh=force_prompt_refresh,
-                force_regenerate=force_regenerate,
-            )
-            status = result.get("status")
-            if status in {"generated", "already_generated"}:
-                generated += 1
-            elif status in {"failed", "prompt_unavailable", "not_found"}:
-                failed += 1
-            progress = idx / total
-            _update_job_progress(job.id, progress, f"page_{page.page_number}_{status}")
-            _check_job_control(job.id)
-
-        return {
-            "book_id": job.book_id,
-            "total_pages": len(pages),
-            "generated": generated,
-            "failed": failed,
-        }
-
-    raise ValueError(f"Unsupported job_type: {job.job_type}")
-
-
-def _mark_job_failure(job_id: int, error: str):
-    db = SessionLocal()
-    try:
-        job = db.get(GenerationJob, job_id)
-        if job is None:
-            return
-        if job.status in {JOB_STATUS_PAUSED, JOB_STATUS_CANCELED}:
-            return
-        job.attempts = int(job.attempts or 0) + 1
-        job.last_error = error[:2000]
-        job.updated_at = datetime.utcnow()
-
-        if job.attempts < job.max_attempts:
-            delay = min(60, 2 ** job.attempts)
-            job.status = JOB_STATUS_QUEUED
-            job.run_after = datetime.utcnow() + timedelta(seconds=delay)
-        else:
-            job.status = JOB_STATUS_FAILED
-            job.completed_at = datetime.utcnow()
-        db.add(job)
-        db.commit()
-    finally:
-        db.close()
-
-
-def _mark_job_paused(job_id: int):
-    db = SessionLocal()
-    try:
-        job = db.get(GenerationJob, job_id)
-        if job is None:
-            return
-        payload = _read_payload(job.payload)
-        payload.pop("pause_requested", None)
-        payload.pop("cancel_requested", None)
-        job.status = JOB_STATUS_PAUSED
-        job.run_after = None
-        job.completed_at = None
-        job.payload = json.dumps(payload)
-        job.updated_at = datetime.utcnow()
-        db.add(job)
-        db.commit()
-    finally:
-        db.close()
-
-
-def _mark_job_canceled(job_id: int):
-    db = SessionLocal()
-    try:
-        job = db.get(GenerationJob, job_id)
-        if job is None:
-            return
-        payload = _read_payload(job.payload)
-        payload.pop("pause_requested", None)
-        payload.pop("cancel_requested", None)
-        job.status = JOB_STATUS_CANCELED
-        job.run_after = None
-        job.completed_at = datetime.utcnow()
-        job.payload = json.dumps(payload)
-        job.updated_at = datetime.utcnow()
-        db.add(job)
-        db.commit()
-    finally:
-        db.close()
-
-
-def _update_job_progress(job_id: int, progress: float, status_note: Optional[str] = None):
-    db = SessionLocal()
-    try:
-        job = db.get(GenerationJob, job_id)
-        if job is None:
-            return
-        job.progress = min(0.99, max(0.0, progress))
-        if status_note:
-            payload = _read_payload(job.payload)
-            payload["status_note"] = status_note
-            job.payload = json.dumps(payload)
-        job.updated_at = datetime.utcnow()
-        db.add(job)
-        db.commit()
-    finally:
-        db.close()
-
-
-def _check_job_control(job_id: int):
-    db = SessionLocal()
-    try:
-        job = db.get(GenerationJob, job_id)
-        if job is None:
-            raise JobCanceled()
-        if job.status == JOB_STATUS_CANCELED:
-            raise JobCanceled()
-        if job.status == JOB_STATUS_PAUSED:
-            raise JobPaused()
-
-        payload = _read_payload(job.payload)
-        if payload.get("cancel_requested"):
-            raise JobCanceled()
-        if payload.get("pause_requested"):
-            raise JobPaused()
-    finally:
-        db.close()
-
-
-def _read_payload(payload: Optional[str]) -> dict:
-    if not payload:
-        return {}
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _read_env_bool(name: str, default: bool) -> bool:
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on"}
-
-
-def _serialize_job(job: GenerationJob) -> dict:
-    return {
-        "id": job.id,
-        "book_id": job.book_id,
-        "page_id": job.page_id,
-        "job_type": job.job_type,
-        "status": job.status,
-        "progress": float(job.progress or 0.0),
-        "attempts": int(job.attempts or 0),
-        "max_attempts": int(job.max_attempts or 0),
-        "payload": _read_payload(job.payload),
-        "result": _read_payload(job.result),
-        "last_error": job.last_error,
-        "run_after": job.run_after.isoformat() if job.run_after else None,
-        "created_at": job.created_at.isoformat() if job.created_at else None,
-        "started_at": job.started_at.isoformat() if job.started_at else None,
-        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
-    }
+    worker = GenerationWorker()
+    worker.start()
+    return worker

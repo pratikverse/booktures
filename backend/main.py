@@ -1,65 +1,66 @@
+"""
+Main Entry Point: Initializes the FastAPI application, mounts middleware/routes,
+and manages the application lifespan (startup/shutdown tasks).
+"""
+
+import os
+import uvicorn
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pathlib import Path
-from database import engine, Base, ensure_sqlite_schema
-from models import (  # ensure models register with Base
-    book,
-    page,
-    character,
-    page_character,
-    page_asset,
-    generation_job,
-)
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+from database import init_db
+from services.generation_queue_service import start_worker
 from api.routes import router
-from services.generation_queue_service import start_worker, stop_worker
-from services.settings_service import apply_env_file
 
-apply_env_file()
-Base.metadata.create_all(bind=engine)
-ensure_sqlite_schema()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Handles startup and shutdown events.
+    Ensures the database is initialized and pgvector is enabled.
+    """
+    print("Initializing database...")
+    try:
+        # This ensures the DB exists and extensions are enabled before accepting requests
+        init_db()
+        print("Database initialized successfully.")
+    except Exception as e:
+        print(f"❌ CRITICAL: Database initialization failed: {e}")
+        raise e  # Fail early so you know exactly what's wrong on startup
+    
+    # Start the background generation worker
+    start_worker()
 
-app = FastAPI(title="Booktures Backend")
+    yield
+    # Shutdown logic goes here if needed
 
+app = FastAPI(
+    title="Booktures API",
+    description="Advanced PDF processing and vector storage service.",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+# Allow your frontend to talk to the backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=["*"],  # In production, replace with your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Mount the storage directory so the frontend can access PDFs and Images
+if not os.path.exists("storage"):
+    os.makedirs("storage")
+app.mount("/storage", StaticFiles(directory="storage"), name="storage")
+
+# Include the routes from our api module
 app.include_router(router)
-_BACKEND_ROOT = Path(__file__).resolve().parent
-_IMAGE_DIR = _BACKEND_ROOT / "storage" / "images"
-_PDF_DIR = _BACKEND_ROOT / "storage" / "pdfs"
-app.mount(
-    "/storage/images",
-    StaticFiles(directory=str(_IMAGE_DIR), check_dir=False),
-    name="storage-images",
-)
-app.mount(
-    "/storage/pdfs",
-    StaticFiles(directory=str(_PDF_DIR), check_dir=False),
-    name="storage-pdfs",
-)
-
-
-@app.on_event("startup")
-def on_startup():
-    start_worker()
-
-
-@app.on_event("shutdown")
-def on_shutdown():
-    stop_worker()
-
 
 @app.get("/")
-def root():
-    return {"status": "Booktures backend running"}
+async def root():
+    return {"message": "Welcome to Booktures 2.0 API", "docs": "/docs"}
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
