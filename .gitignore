@@ -1,0 +1,47 @@
+# Root ignores (applies to backend + frontend)
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+*.py[cod]
+*$py.class
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+env/
+ENV/
+
+# Node / frontend
+**/node_modules/
+**/.vite/
+coverage/
+dist/
+dist-ssr/
+
+# Build artifacts
+build/
+*.egg-info/
+
+# Runtime logs
+*.log
+*.pid
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Markdown docs
+
+
+# App generated storage
+backend/storage/
+
