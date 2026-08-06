@@ -1,15 +1,34 @@
 import os
 import subprocess
-from dotenv import set_key, load_dotenv
 import httpx
-
-ENV_FILE = ".env"
+from database import SessionLocal
+from models import AppSetting
 
 def update_setting(key: str, value: str):
-    """Persists a setting to the .env file and active environment."""
-    set_key(ENV_FILE, key, value)
+    """Persists a setting to the DB-backed settings table and the active process environment.
+
+    DB-backed (not .env) so this works on read-only/ephemeral filesystems in production.
+    """
+    db = SessionLocal()
+    try:
+        row = db.query(AppSetting).filter(AppSetting.key == key).first()
+        if row:
+            row.value = value
+        else:
+            db.add(AppSetting(key=key, value=value))
+        db.commit()
+    finally:
+        db.close()
     os.environ[key] = value
-    load_dotenv(ENV_FILE, override=True)
+
+def load_persisted_settings():
+    """Loads all DB-persisted settings into the process environment. Call once at startup."""
+    db = SessionLocal()
+    try:
+        for row in db.query(AppSetting).all():
+            os.environ[row.key] = row.value
+    finally:
+        db.close()
 
 def get_available_ollama_models(base_url: str | None = None):
     """Detects available models from Ollama's HTTP API, with CLI fallback."""
