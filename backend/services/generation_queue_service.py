@@ -1,5 +1,6 @@
 import threading
 import time
+from sqlalchemy import text
 from database import SessionLocal
 from models import Job, Book, DocumentChunk, Character, PageAsset
 from services import pdf_service
@@ -16,23 +17,44 @@ class GenerationWorker(threading.Thread):
         self.running = True
 
     def run(self):
+        # Reclaim any jobs left "running" by a previous process that died/restarted.
+        self._reset_orphaned_jobs()
+
         while self.running:
             db = SessionLocal()
             try:
-                # Claim the oldest queued job
-                job = db.query(Job).filter(Job.status == "queued").order_by(Job.created_at).first()
-                
+                # Claim the oldest queued job atomically, safe for multiple workers.
+                job = db.execute(
+                    text(
+                        "SELECT id FROM jobs WHERE status = 'queued' "
+                        "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1"
+                    )
+                ).first()
+
                 if job:
-                    job.status = "running"
+                    job_obj = db.query(Job).filter(Job.id == job.id).first()
+                    job_obj.status = "running"
                     db.commit()
-                    
-                    self._execute_job(job, db)
-                    
-                db.close()
+
+                    self._execute_job(job_obj, db)
             except Exception as e:
                 logger.error(f"Worker Error: {e}")
-            
+            finally:
+                db.close()
+
             time.sleep(5) # Poll every 5 seconds
+
+    def _reset_orphaned_jobs(self):
+        db = SessionLocal()
+        try:
+            db.query(Job).filter(Job.status == "running").update(
+                {"status": "queued", "status_note": "Requeued after worker restart."}
+            )
+            db.commit()
+        except Exception as e:
+            logger.error(f"Failed to reset orphaned jobs: {e}")
+        finally:
+            db.close()
 
     def _execute_job(self, job, db):
         try:
@@ -70,6 +92,14 @@ class GenerationWorker(threading.Thread):
             db.add(chunk)
             chunks.append(chunk)
         db.commit()
+
+        if not chunks:
+            job.status = "completed"
+            job.status_note = "No extractable text found in this file."
+            book.status = "failed"
+            book.progress = 0.0
+            db.commit()
+            return
 
         job.status_note = "Building Character Visual Bible..."
         job.progress = 0.2
@@ -136,6 +166,14 @@ class GenerationWorker(threading.Thread):
         visual_bible = "\n".join([f"- {c.name}: {c.visual_profile}" for c in characters]) or "No characters identified."
 
         assets = db.query(PageAsset).join(DocumentChunk).filter(DocumentChunk.book_id == book.id).all()
+        if not assets:
+            job.status = "completed"
+            job.status_note = "No pages available for image generation."
+            book.status = "completed"
+            book.progress = 1.0
+            db.commit()
+            return
+
         for i, asset in enumerate(assets):
             # Check for cancellation or pause status
             db.refresh(job)

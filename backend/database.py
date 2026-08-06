@@ -12,11 +12,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_DB_URL = "postgresql://postgres:rmcf@localhost:5432/booktures"
-DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DB_URL)
+import logging
+logger = logging.getLogger(__name__)
 
-if DATABASE_URL == DEFAULT_DB_URL:
-    print("⚠️ Warning: Using default hardcoded DATABASE_URL. Ensure PostgreSQL password is 'rmcf'.")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. Create a backend/.env file (see .env.example) "
+        "with a valid PostgreSQL connection string."
+    )
+
+# Managed Postgres providers (Supabase/Neon/RDS) rarely grant permission to
+# connect to the 'postgres' admin database or run CREATE DATABASE. Skip that
+# step there and rely on the target database already existing.
+SKIP_DB_AUTOCREATE = os.getenv("SKIP_DB_AUTOCREATE", "false").lower() == "true"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -44,17 +53,20 @@ def _ensure_database_exists():
             # Check if database exists
             result = conn.execute(text("SELECT 1 FROM pg_database WHERE datname = :db_name"), {"db_name": db_name})
             if not result.scalar():
-                print(f"Creating database '{db_name}'...")
+                logger.info(f"Creating database '{db_name}'...")
                 conn.execute(text(f'CREATE DATABASE "{db_name}"'))
         except exc.OperationalError as e:
-            print(f"ℹ️ Database existence check skipped: {e}")
+            logger.info(f"Database existence check skipped: {e}")
 
 def init_db():
-    """Initializes the database, creating the vector extension and tables."""
-    try:
-        _ensure_database_exists()
-    except Exception as e:
-        print(f"⚠️ Could not verify/create database: {e}")
+    """Initializes the database and tables."""
+    if not SKIP_DB_AUTOCREATE:
+        try:
+            _ensure_database_exists()
+        except Exception as e:
+            logger.warning(f"Could not verify/create database: {e}")
+    else:
+        logger.info("SKIP_DB_AUTOCREATE set; assuming target database already exists.")
 
     import models  # Import here to avoid circular dependencies
     Base.metadata.create_all(bind=engine)

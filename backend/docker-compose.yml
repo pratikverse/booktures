@@ -5,9 +5,9 @@ services:
     container_name: booktures_db
     restart: always
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=rmcf
-      - POSTGRES_DB=booktures
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in backend/.env}
+      - POSTGRES_DB=${POSTGRES_DB:-booktures}
     ports:
       - "5432:5432"
     volumes:

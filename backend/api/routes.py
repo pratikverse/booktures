@@ -16,6 +16,8 @@ from services.generation_queue_service import GenerationWorker # Import worker f
 # Removed prefix to match frontend root-level requests
 router = APIRouter(tags=["books"])
 
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "25")) * 1024 * 1024
+
 
 def _public_storage_url(path: str | None) -> str | None:
     """Normalize DB file paths into browser-accessible /storage URLs."""
@@ -63,8 +65,14 @@ async def upload_book(
     if not any(file.filename.lower().endswith(ext) for ext in allowed_extensions):
         raise HTTPException(status_code=400, detail=f"Unsupported file type. Allowed: {', '.join(allowed_extensions)}")
 
-    # Read file content into memory and save to disk
-    content = await file.read()
+    # Read file content in chunks so oversized uploads are rejected before
+    # the whole file is buffered in memory.
+    content = bytearray()
+    while chunk := await file.read(1024 * 1024):
+        content.extend(chunk)
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"File exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit.")
+    content = bytes(content)
     try:
         file_path = pdf_service.save_pdf(content, file.filename)
     except Exception as e:
