@@ -17,6 +17,7 @@ import logging
 import re
 from typing import Any
 from pathlib import Path
+from providers.llm_provider import get_llm_provider
 
 load_dotenv()
 
@@ -120,32 +121,7 @@ def ollama_generate(prompt: str, model: str = None, system: str = "") -> str:
     """
     if not OLLAMA_ENABLED:
         return ""
-
-    if model is None:
-        model = OLLAMA_DEFAULT_MODEL
-
-    payload: dict[str, Any] = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-    }
-    if system:
-        payload["system"] = system
-
-    try:
-        response = httpx.post(
-            f"{OLLAMA_BASE_URL}/api/generate",
-            # stream=False ensures we wait for the full response before proceeding
-            json=payload,
-            timeout=OLLAMA_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        return response.json().get("response", "").strip()
-    except httpx.HTTPError as exc:
-        logger.warning("Ollama HTTP request failed (model=%s): %s", model, exc)
-    except Exception as exc:
-        logger.warning("Unexpected Ollama error (model=%s): %s", model, exc)
-    return ""
+    return get_llm_provider().generate(prompt, system=system, model=model)
 
 
 def _safe_parse_json(raw: str, fallback: dict) -> dict:
