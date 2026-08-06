@@ -30,7 +30,7 @@ upload and processing across instances, which isn't planned yet.
 STORAGE_PROVIDER=local     # or supabase, r2
 SUPABASE_URL=
 SUPABASE_SERVICE_KEY=
-SUPABASE_BUCKET=booktures
+SUPABASE_BUCKET=Booktures
 
 R2_ACCOUNT_ID=
 R2_BUCKET=
@@ -40,4 +40,17 @@ R2_PUBLIC_URL=
 
 LLM_PROVIDER=gemini        # or ollama, groq
 GEMINI_API_KEY=
+GROQ_API_KEY=
 ```
+
+## Supabase — verified working
+
+Local dev is now pointed at a real Supabase project (Postgres + Storage, local
+`.env`, not committed):
+
+- `alembic upgrade head` ran cleanly against the Supabase Postgres instance,
+  baseline schema created.
+- Upload and public-read against the `Booktures` bucket both confirmed working
+  via the storage REST API.
+- Bucket needs the **Public** toggle on, since `SupabaseStorageProvider` returns
+  `.../storage/v1/object/public/<bucket>/<key>` URLs (no signed-URL support yet).
