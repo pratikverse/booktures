@@ -1,0 +1,35 @@
+# Minimal dependencies to run the FastAPI API + job worker WITHOUT local
+# GPU inference (LLM/image calls go through cloud providers instead).
+# Use this set for cloud/free-tier deployment. For full local Ollama +
+# Diffusers inference, use requirements-local-gpu.txt on top of this file.
+
+fastapi==0.135.1
+uvicorn==0.41.0
+starlette==0.52.1
+pydantic==2.12.5
+pydantic_core==2.41.5
+python-multipart==0.0.22
+python-dotenv==1.2.2
+
+SQLAlchemy==2.0.48
+psycopg2-binary==2.9.11
+alembic==1.14.0
+
+httpx==0.28.1
+requests==2.32.5
+
+pdfplumber==0.11.9
+pdfminer.six==20251230
+pypdfium2==5.6.0
+pytesseract==0.3.13
+pillow==12.1.1
+
+rapidfuzz==3.14.3
+
+# Character NER (CPU-only small model; character_service.py currently requires this
+# even in the cloud profile — planned for replacement by an LLM-based extractor in Phase 1)
+spacy==3.8.11
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85
+
+# Text-only cloud LLM SDKs (pick what your provider integration uses)
+openai==2.26.0

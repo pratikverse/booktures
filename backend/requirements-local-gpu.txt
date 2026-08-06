@@ -1,0 +1,20 @@
+# Additional dependencies for full local inference (Ollama + Diffusers on a
+# local GPU/CPU). Install AFTER requirements-api.txt:
+#   pip install -r requirements-api.txt -r requirements-local-gpu.txt
+
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+diffusers==0.37.0
+transformers==4.57.6
+accelerate==1.13.0
+safetensors==0.7.0
+tokenizers==0.22.2
+huggingface_hub==0.36.2
+hf-xet==1.3.2
+
+# Larger transformer-based NER model, optional upgrade over en_core_web_sm
+en_core_web_trf @ https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.8.0/en_core_web_trf-3.8.0-py3-none-any.whl#sha256=272a31e9d8530d1e075351d30a462d7e80e31da23574f1b274e200f3fff35bf5
+curated-tokenizers==0.0.9
+curated-transformers==0.1.1
+spacy-curated-transformers==0.3.1
