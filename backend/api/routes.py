@@ -45,6 +45,20 @@ def _public_storage_url(path: str | None) -> str | None:
     # Fallback for legacy relative records.
     return f"/{normalized.lstrip('/')}"
 
+
+def _storage_key_from_path(path: str | None) -> str | None:
+    """Recover the provider-relative key (e.g. "pdfs/x.pdf") from either a
+    local relative path or a full storage-provider URL, so it can be handed
+    to StorageProvider.delete() regardless of which provider saved it."""
+    if not path:
+        return None
+    normalized = path.replace("\\", "/")
+    for marker in ("/pdfs/", "/illustrations/"):
+        idx = normalized.find(marker)
+        if idx != -1:
+            return normalized[idx + 1:]
+    return None
+
 # --- Library Endpoints ---
 
 @router.get("/books", response_model=List[dict])
@@ -120,6 +134,37 @@ def get_book_details(book_id: int, db: Session = Depends(get_db)):
         "file_path": db_book.file_path,
         "status": db_book.status
     }
+
+@router.delete("/books/{book_id}")
+def delete_book(book_id: int, db: Session = Depends(get_db)):
+    """Delete a book, its extracted content, and its stored files."""
+    db_book = db.query(models.Book).filter(models.Book.id == book_id).first()
+    if not db_book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    from providers.storage_provider import get_storage_provider
+
+    storage = get_storage_provider()
+    chunks = db.query(models.DocumentChunk).filter(models.DocumentChunk.book_id == book_id).all()
+    chunk_ids = [c.id for c in chunks]
+
+    for chunk in chunks:
+        key = _storage_key_from_path(chunk.illustration_path)
+        if key:
+            storage.delete(key)
+    pdf_key = _storage_key_from_path(db_book.file_path)
+    if pdf_key:
+        storage.delete(pdf_key)
+
+    if chunk_ids:
+        db.query(models.PageAsset).filter(models.PageAsset.chunk_id.in_(chunk_ids)).delete(synchronize_session=False)
+    db.query(models.DocumentChunk).filter(models.DocumentChunk.book_id == book_id).delete(synchronize_session=False)
+    db.query(models.Character).filter(models.Character.book_id == book_id).delete(synchronize_session=False)
+    db.query(models.Job).filter(models.Job.book_id == book_id).delete(synchronize_session=False)
+    db.delete(db_book)
+    db.commit()
+
+    return {"message": "Book deleted."}
 
 @router.get("/books/{book_id}/content")
 def get_book_content(book_id: int, db: Session = Depends(get_db)):

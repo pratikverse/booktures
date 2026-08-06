@@ -9,6 +9,7 @@ export {
   getBookContent,
   uploadPdf,
   generateBookImages,
+  deleteBook,
 } from "@/services/books";
 export { getJobs, manageJobAction } from "@/services/jobs";
 export { getSettings, getOllamaModels, saveSettings } from "@/services/settings";

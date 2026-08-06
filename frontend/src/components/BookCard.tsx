@@ -1,9 +1,20 @@
-import { Book, generateBookImages, uploadPdf } from "@/lib/api";
+import { Book, deleteBook, generateBookImages } from "@/lib/api";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
-import { BookOpen, Sparkles } from "lucide-react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
+import { BookOpen, Sparkles, Trash2 } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -45,6 +56,16 @@ export default function BookCard({ book }: { book: Book }) {
     onError: (e) => toast.error((e as { message?: string })?.message ?? "Failed"),
   });
 
+  const deleteMut = useMutation({
+    mutationFn: () => deleteBook(book.id),
+    onSuccess: () => {
+      toast.success(`Deleted "${book.title}"`);
+      qc.invalidateQueries({ queryKey: ["books"] });
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+    },
+    onError: (e) => toast.error((e as { message?: string })?.message ?? "Delete failed"),
+  });
+
   return (
     <Card className="p-5 shadow-card hover:shadow-elegant transition-shadow flex flex-col gap-4">
       <div className="flex items-start gap-3">
@@ -82,6 +103,26 @@ export default function BookCard({ book }: { book: Book }) {
             {genMut.isPending ? "..." : "Generate"}
           </Button>
         )}
+        <AlertDialog>
+          <AlertDialogTrigger asChild>
+            <Button variant="outline" size="icon" disabled={deleteMut.isPending} aria-label="Delete book">
+              <Trash2 className="size-4" />
+            </Button>
+          </AlertDialogTrigger>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>Delete "{book.title}"?</AlertDialogTitle>
+              <AlertDialogDescription>
+                This permanently removes the book, its extracted pages, characters, and generated
+                illustrations. This can't be undone.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogAction onClick={() => deleteMut.mutate()}>Delete</AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
     </Card>
   );

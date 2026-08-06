@@ -39,3 +39,8 @@ export async function generateBookImages(id: number): Promise<{ message: string 
   const { data } = await apiClient.post(`/books/${id}/generate-images`, {});
   return data;
 }
+
+export async function deleteBook(id: number): Promise<{ message: string }> {
+  const { data } = await apiClient.delete(`/books/${id}`);
+  return data;
+}
