@@ -122,20 +122,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 # 🔌 Backend Environment
 
-Create a `.env` file inside `backend/`.
-
-```env
-DATABASE_URL=postgresql://postgres:rmcf@localhost:5432/booktures
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_DEFAULT_MODEL=qwen2.5:7b
-OLLAMA_FAST_MODEL=phi3
-OLLAMA_TIMEOUT_SECONDS=180
-OLLAMA_ENABLED=True
-IMAGE_PRESET=balanced
-DIFFUSION_MODEL=segmind/SSD-1B
-IMAGE_WIDTH=768
-IMAGE_HEIGHT=768
-```
+Copy `backend/.env.example` to `backend/.env` and set your own `DATABASE_URL` / `POSTGRES_PASSWORD` (required — the app no longer falls back to a hardcoded password).
 
 > Note: The code currently uses Ollama for text and prompt generation, and Diffusers for local image generation.
 
@@ -146,8 +133,11 @@ IMAGE_HEIGHT=768
 From the repository root:
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt   # full local dev (API + GPU inference stack)
+# or for a lean cloud/API-only install:
+# pip install -r backend/requirements-api.txt
 cd backend
+alembic upgrade head
 uvicorn main:app --reload
 ```
 
