@@ -67,5 +67,15 @@ Tested against real accounts:
 - Cloudflare Workers AI (`IMAGE_PROVIDER=workers-ai`) — added and works,
   needs `CF_ACCOUNT_ID` + `CF_API_TOKEN` (Workers AI: Edit permission).
   Default model `@cf/stabilityai/stable-diffusion-xl-base-1.0` renders a
-  flatter, more cartoon-ish style than Pollinations — pick based on which
-  look fits the book's illustration style.
+  flatter, more cartoon-ish style than Pollinations.
+
+## Multi-character prompt accuracy: Workers AI vs Pollinations
+
+Ran the same two-character prompts (from a real end-to-end pipeline test)
+through both providers. Pollinations dropped a character in both cases —
+a "Holmes pacing alone" prompt rendered three people, and a "Holmes standing
++ Watson seated" prompt rendered only one seated person. Workers AI got the
+character count right both times (including correctly rendering two distinct
+people interacting at a table), though exact pose still isn't always followed.
+Set `IMAGE_PROVIDER=workers-ai` as the working default for cloud deploys;
+Pollinations stays available as a no-key fallback.
