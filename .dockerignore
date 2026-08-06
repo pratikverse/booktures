@@ -1,0 +1,12 @@
+frontend/
+docs/
+md/
+.git/
+.github/
+**/__pycache__/
+**/*.pyc
+backend/.env
+backend/storage/
+backend/requirements-local-gpu.txt
+backend/alembic/versions/__pycache__/
+*.md

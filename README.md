@@ -1,3 +1,13 @@
+---
+title: Booktures
+emoji: 📚
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # 📚 Booktures
 
 > Booktures is a local AI-driven book illustration platform that extracts narrative context from PDFs and generates consistent, scene-aware visuals.
