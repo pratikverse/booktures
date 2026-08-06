@@ -4,6 +4,7 @@ import type { Settings } from "./types";
 type BackendSettings = {
   llm_provider: string;
   llm_model: string;
+  image_provider: string;
   ollama_url: string;
   model_name: string;
   timeout: number;
@@ -20,6 +21,7 @@ function toFrontendSettings(b: BackendSettings): Settings {
   return {
     llmProvider: b.llm_provider,
     llmModel: b.llm_model,
+    imageProvider: b.image_provider,
     ollamaUrl: b.ollama_url,
     modelName: b.model_name,
     timeout: b.timeout,

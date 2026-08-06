@@ -68,6 +68,7 @@ export default function SettingsPage() {
   };
 
   const customDisabled = s.imageMode !== "custom";
+  const supportsModelAndGuidance = s.imageProvider === "diffusers";
 
   return (
     <div className="mx-auto max-w-3xl space-y-6 p-6 md:p-8">
@@ -127,7 +128,14 @@ export default function SettingsPage() {
       </Card>
 
       <Card className="p-6 space-y-4 shadow-card">
-        <h2 className="font-semibold text-lg">Image Generation</h2>
+        <div>
+          <h2 className="font-semibold text-lg">Image Generation</h2>
+          <p className="text-xs text-muted-foreground mt-1">
+            Active provider:{" "}
+            <span className="font-mono uppercase tracking-wide">{s.imageProvider}</span>
+            {!supportsModelAndGuidance && " — model and guidance are fixed by this provider and not configurable here."}
+          </p>
+        </div>
         <div className="grid sm:grid-cols-2 gap-4">
           <div className="grid gap-2">
             <Label>Image Mode</Label>
@@ -153,14 +161,16 @@ export default function SettingsPage() {
           </div>
         </div>
 
-        <div className="grid gap-2">
-          <Label>Image Model</Label>
-          <Input
-            value={s.imageModel}
-            disabled={customDisabled}
-            onChange={(e) => update("imageModel", e.target.value)}
-          />
-        </div>
+        {supportsModelAndGuidance && (
+          <div className="grid gap-2">
+            <Label>Image Model</Label>
+            <Input
+              value={s.imageModel}
+              disabled={customDisabled}
+              onChange={(e) => update("imageModel", e.target.value)}
+            />
+          </div>
+        )}
 
         <div className="grid sm:grid-cols-2 gap-4">
           <div className="grid gap-2">
@@ -183,6 +193,9 @@ export default function SettingsPage() {
           </div>
           <div className="grid gap-2">
             <Label>Steps</Label>
+            {s.imageProvider === "workers-ai" && (
+              <p className="text-xs text-muted-foreground">Capped at 20 by this provider.</p>
+            )}
             <Input
               type="number"
               value={s.imageSteps}
@@ -190,16 +203,18 @@ export default function SettingsPage() {
               onChange={(e) => update("imageSteps", Number(e.target.value))}
             />
           </div>
-          <div className="grid gap-2">
-            <Label>Guidance</Label>
-            <Input
-              type="number"
-              step="0.1"
-              value={s.imageGuidance}
-              disabled={customDisabled}
-              onChange={(e) => update("imageGuidance", Number(e.target.value))}
-            />
-          </div>
+          {supportsModelAndGuidance && (
+            <div className="grid gap-2">
+              <Label>Guidance</Label>
+              <Input
+                type="number"
+                step="0.1"
+                value={s.imageGuidance}
+                disabled={customDisabled}
+                onChange={(e) => update("imageGuidance", Number(e.target.value))}
+              />
+            </div>
+          )}
         </div>
       </Card>
 

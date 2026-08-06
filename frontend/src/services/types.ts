@@ -67,6 +67,7 @@ export interface Character {
 export interface Settings {
   llmProvider: string;
   llmModel: string;
+  imageProvider: string;
   ollamaUrl: string;
   modelName: string;
   timeout: number;

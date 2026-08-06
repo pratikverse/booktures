@@ -259,6 +259,7 @@ def get_settings():
     return {
         "llm_provider": llm_provider,
         "llm_model": llm_model,
+        "image_provider": os.getenv("IMAGE_PROVIDER", "diffusers").strip().lower(),
         "ollama_url": pdf_service.OLLAMA_BASE_URL,
         "model_name": pdf_service.OLLAMA_DEFAULT_MODEL,
         "timeout": int(pdf_service.OLLAMA_TIMEOUT_SECONDS),
