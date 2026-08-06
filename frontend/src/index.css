@@ -111,3 +111,33 @@
     letter-spacing: -0.02em;
   }
 }
+
+@layer utilities {
+  .grid-backdrop {
+    background-image:
+      linear-gradient(to right, hsl(var(--border)) 1px, transparent 1px),
+      linear-gradient(to bottom, hsl(var(--border)) 1px, transparent 1px);
+    background-size: 64px 64px;
+    opacity: 0.25;
+  }
+
+  .num {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+
+  .rise {
+    animation: cs-rise 0.45s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  }
+}
+
+@keyframes cs-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

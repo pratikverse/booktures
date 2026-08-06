@@ -20,6 +20,7 @@ import {
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Loader2 } from "lucide-react";
+import PageHeader from "@/components/PageHeader";
 
 export default function SettingsPage() {
   const { data: initial, isLoading } = useQuery({
@@ -68,11 +69,12 @@ export default function SettingsPage() {
   const customDisabled = s.imageMode !== "custom";
 
   return (
-    <div className="p-6 md:p-8 max-w-3xl space-y-6">
-      <div>
-        <h1 className="text-3xl font-bold tracking-tight">Settings</h1>
-        <p className="text-muted-foreground mt-1">Configure AI providers and image generation.</p>
-      </div>
+    <div className="mx-auto max-w-3xl space-y-6 p-6 md:p-8">
+      <PageHeader
+        kicker="Configuration"
+        title="Settings"
+        subtitle="Configure AI providers and image generation."
+      />
 
       <Card className="p-6 space-y-4 shadow-card">
         <h2 className="font-semibold text-lg">Ollama</h2>

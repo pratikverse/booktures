@@ -8,6 +8,7 @@ import Library from "./pages/Library";
 import Jobs from "./pages/Jobs";
 import SettingsPage from "./pages/SettingsPage";
 import BookViewer from "./pages/BookViewer";
+import HowItWorks from "./pages/HowItWorks";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -23,6 +24,7 @@ const App = () => (
             <Route path="/" element={<Library />} />
             <Route path="/jobs" element={<Jobs />} />
             <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/how-it-works" element={<HowItWorks />} />
             <Route path="/books/:bookId" element={<BookViewer />} />
           </Route>
           <Route path="*" element={<NotFound />} />

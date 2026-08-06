@@ -1,11 +1,20 @@
-import { useQuery } from "@tanstack/react-query";
-import { getBooks } from "@/lib/api";
+import { useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { getBooks, uploadPdf } from "@/lib/api";
+import { Loader2, Search, Upload } from "lucide-react";
+import { toast } from "sonner";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 import BookCard from "@/components/BookCard";
-import { useOutletContext } from "react-router-dom";
-import { Loader2 } from "lucide-react";
+import PipelineStrip from "@/components/PipelineStrip";
 
 export default function Library() {
-  const ctx = useOutletContext<{ search: string }>();
+  const qc = useQueryClient();
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [search, setSearch] = useState("");
+
   const { data: books = [], isLoading } = useQuery({
     queryKey: ["books"],
     queryFn: getBooks,
@@ -20,36 +29,111 @@ export default function Library() {
   });
 
   const filtered = books.filter((b) =>
-    ctx?.search ? b.title.toLowerCase().includes(ctx.search.toLowerCase()) : true
+    search ? b.title.toLowerCase().includes(search.toLowerCase()) : true
   );
 
-  return (
-    <div className="p-6 md:p-8">
-      <div className="mb-6">
-        <h1 className="text-3xl font-bold tracking-tight">Your Library</h1>
-        <p className="text-muted-foreground mt-1">
-          Upload a PDF to bring it to life with AI-generated illustrations.
-        </p>
-      </div>
+  const handleUpload = async (file: File) => {
+    const allowed = ["application/pdf", "image/png", "image/jpeg"];
+    if (!allowed.includes(file.type)) {
+      toast.error("Please upload a PDF or JPG/PNG image.");
+      return;
+    }
+    setUploading(true);
+    setUploadProgress(0);
+    try {
+      const res = await uploadPdf(file, setUploadProgress);
+      toast.success(`Uploaded "${res.title}"`);
+      qc.invalidateQueries({ queryKey: ["books"] });
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+    } catch (e) {
+      toast.error((e as { message?: string })?.message ?? "Upload failed");
+    } finally {
+      setUploading(false);
+      setUploadProgress(0);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  };
 
-      {isLoading ? (
-        <div className="grid place-items-center py-20 text-muted-foreground">
-          <Loader2 className="size-6 animate-spin" />
+  return (
+    <div className="relative overflow-hidden">
+      <div className="grid-backdrop pointer-events-none absolute inset-0" aria-hidden="true" />
+      <div
+        className="pointer-events-none absolute -top-40 left-1/2 size-[36rem] -translate-x-1/2 rounded-full bg-primary/20 blur-[140px]"
+        aria-hidden="true"
+      />
+
+      <section className="relative mx-auto max-w-7xl px-5 py-16 sm:py-20">
+        <p className="font-mono text-[11px] uppercase tracking-[0.25em] text-primary">
+          AI illustrated reading · local + cloud pipeline
+        </p>
+        <h1 className="mt-5 max-w-3xl font-display text-4xl font-bold leading-[1.05] sm:text-5xl">
+          Books can&apos;t picture themselves.
+        </h1>
+        <p className="mt-5 max-w-2xl text-base leading-relaxed text-muted-foreground sm:text-lg">
+          Upload a PDF and Booktures reads it page by page — pulling out the narrative, tracking
+          characters across chapters, and generating consistent illustrations for the scenes as
+          they happen.
+        </p>
+
+        <div className="mt-8 flex items-center gap-3">
+          <input
+            ref={fileRef}
+            type="file"
+            accept="application/pdf,image/*"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) handleUpload(f);
+            }}
+          />
+          <Button
+            onClick={() => fileRef.current?.click()}
+            disabled={uploading}
+            className="gap-2 rounded-sm bg-primary px-5 py-3 text-sm font-medium text-primary-foreground hover:opacity-90"
+          >
+            <Upload className="size-4" />
+            {uploading ? `Uploading ${uploadProgress}%` : "Upload a PDF"}
+          </Button>
         </div>
-      ) : filtered.length === 0 ? (
-        <div className="border-2 border-dashed border-border rounded-xl p-16 text-center">
-          <h3 className="font-semibold text-lg">No books yet</h3>
-          <p className="text-muted-foreground mt-1">
-            Click "Upload PDF" in the top bar to get started.
-          </p>
+
+        <div className="mt-16">
+          <PipelineStrip />
         </div>
-      ) : (
-        <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-          {filtered.map((b) => (
-            <BookCard key={b.id} book={b} />
-          ))}
+      </section>
+
+      <section className="relative mx-auto max-w-7xl px-5 pb-16">
+        <div className="mb-6 flex flex-wrap items-center justify-between gap-4 border-t border-border pt-8">
+          <div className="relative w-full max-w-sm">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
+            <Input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search books..."
+              className="pl-9"
+            />
+          </div>
+          <div className="text-sm text-muted-foreground">
+            <span className="font-semibold text-foreground">{books.length}</span> books
+          </div>
         </div>
-      )}
+
+        {isLoading ? (
+          <div className="grid place-items-center py-20 text-muted-foreground">
+            <Loader2 className="size-6 animate-spin" />
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="rounded-md border border-dashed border-border p-16 text-center">
+            <h3 className="font-display text-lg font-semibold">No books yet</h3>
+            <p className="mt-1 text-muted-foreground">Upload a PDF above to get started.</p>
+          </div>
+        ) : (
+          <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+            {filtered.map((b) => (
+              <BookCard key={b.id} book={b} />
+            ))}
+          </div>
+        )}
+      </section>
     </div>
   );
 }

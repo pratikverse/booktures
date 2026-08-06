@@ -13,6 +13,7 @@ export {
 export { getJobs, manageJobAction } from "@/services/jobs";
 export { getSettings, getOllamaModels, saveSettings } from "@/services/settings";
 export { getBookCharacters } from "@/services/characters";
+export { getHealth } from "@/services/health";
 export { apiClient, normalizeApiError } from "@/services/apiClient";
 
 export async function uploadFile(file: File, onProgress?: (progress: number) => void) {

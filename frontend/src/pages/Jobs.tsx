@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Loader2, Pause, Play, X, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
+import PageHeader from "@/components/PageHeader";
 
 const groups: { title: string; statuses: JobStatus[] }[] = [
   { title: "Running", statuses: ["running"] },
@@ -97,8 +98,13 @@ export default function Jobs() {
   });
 
   return (
-    <div className="p-6 md:p-8 max-w-5xl">
-      <h1 className="text-3xl font-bold tracking-tight mb-6">Jobs</h1>
+    <div className="mx-auto max-w-5xl p-6 md:p-8">
+      <PageHeader
+        kicker="Background processing"
+        title="Jobs"
+        subtitle="Track PDF ingestion and illustration generation as they run."
+      />
+      <div className="mt-6">
       {isLoading ? (
         <Loader2 className="size-6 animate-spin text-muted-foreground" />
       ) : jobs.length === 0 ? (
@@ -123,6 +129,7 @@ export default function Jobs() {
           })}
         </div>
       )}
+      </div>
     </div>
   );
 }
