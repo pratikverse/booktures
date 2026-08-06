@@ -26,6 +26,10 @@ def _public_storage_url(path: str | None) -> str | None:
 
     normalized = path.replace("\\", "/")
 
+    # Already a full URL (e.g. cloud storage provider) - use as-is.
+    if normalized.startswith("http://") or normalized.startswith("https://"):
+        return normalized
+
     # Already a public URL path.
     if normalized.startswith("/storage/"):
         return normalized

@@ -17,6 +17,10 @@ GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 GROQ_DEFAULT_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT_SECONDS", "60.0"))
 
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_TIMEOUT_SECONDS = float(os.getenv("GEMINI_TIMEOUT_SECONDS", "60.0"))
+
 
 class LLMProvider:
     def generate(self, prompt: str, system: str = "", model: str | None = None) -> str:
@@ -80,9 +84,40 @@ class GroqProvider(LLMProvider):
         return ""
 
 
+class GeminiProvider(LLMProvider):
+    """Cloud inference via Google's Gemini free-tier API."""
+
+    def generate(self, prompt: str, system: str = "", model: str | None = None) -> str:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            logger.warning("GEMINI_API_KEY not set; skipping LLM call.")
+            return ""
+
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+
+        try:
+            response = httpx.post(
+                f"{GEMINI_BASE_URL}/models/{model or GEMINI_DEFAULT_MODEL}:generateContent",
+                params={"key": api_key},
+                json=body,
+                timeout=GEMINI_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except httpx.HTTPError as exc:
+            logger.warning("Gemini HTTP request failed: %s", exc)
+        except Exception as exc:
+            logger.warning("Unexpected Gemini error: %s", exc)
+        return ""
+
+
 _providers = {
     "ollama": OllamaProvider,
     "groq": GroqProvider,
+    "gemini": GeminiProvider,
 }
 
 

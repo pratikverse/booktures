@@ -35,12 +35,14 @@ def _resolve_generation_config():
     }
 
 
-def _save(image, book_id: int, page_num: int) -> str:
-    book_dir = STORAGE_PATH / f"book_{book_id}"
-    book_dir.mkdir(parents=True, exist_ok=True)
-    file_path = book_dir / f"page_{page_num}.png"
-    image.save(file_path)
-    return f"storage/illustrations/book_{book_id}/page_{page_num}.png"
+def _save(image, book_id: int, page_num: int) -> Optional[str]:
+    from io import BytesIO
+    from providers.storage_provider import get_storage_provider
+
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    key = f"illustrations/book_{book_id}/page_{page_num}.png"
+    return get_storage_provider().save(buf.getvalue(), key, content_type="image/png")
 
 
 class ImageProvider:
