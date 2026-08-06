@@ -4,7 +4,7 @@ and content retrieval.
 """
 
 import os
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Body
+from fastapi import APIRouter, Request, UploadFile, File, Depends, HTTPException, BackgroundTasks, Body
 from sqlalchemy.orm import Session
 from typing import List
 
@@ -12,6 +12,7 @@ from database import get_db, SessionLocal
 import models
 from services import pdf_service, settings_service
 from services.generation_queue_service import GenerationWorker # Import worker for job creation
+from api.limiter import limiter
 
 # Removed prefix to match frontend root-level requests
 router = APIRouter(tags=["books"])
@@ -57,17 +58,18 @@ def list_books(db: Session = Depends(get_db)):
 
 # Changed path from /books/upload to /upload-pdf to match frontend logs
 @router.post("/upload-pdf", response_model=dict)
+@limiter.limit("5/minute")
 async def upload_book(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
     """
-    Uploads a PDF/Image, saves it, and queues a background job for processing.
+    Uploads a PDF, saves it, and queues a background job for processing.
     """
-    allowed_extensions = {".pdf", ".jpg", ".jpeg", ".png"}
-    if not any(file.filename.lower().endswith(ext) for ext in allowed_extensions):
-        raise HTTPException(status_code=400, detail=f"Unsupported file type. Allowed: {', '.join(allowed_extensions)}")
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Unsupported file type. Only .pdf is accepted.")
 
     # Read file content in chunks so oversized uploads are rejected before
     # the whole file is buffered in memory.
@@ -77,6 +79,10 @@ async def upload_book(
         if len(content) > MAX_UPLOAD_BYTES:
             raise HTTPException(status_code=413, detail=f"File exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit.")
     content = bytes(content)
+
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=400, detail="File is not a valid PDF.")
+
     try:
         file_path = pdf_service.save_pdf(content, file.filename)
     except Exception as e:
@@ -166,7 +172,8 @@ def get_book_characters(book_id: int, db: Session = Depends(get_db)):
     return result
 
 @router.post("/books/{book_id}/generate-images", response_model=dict)
-def trigger_image_generation(book_id: int, db: Session = Depends(get_db)):
+@limiter.limit("5/minute")
+def trigger_image_generation(request: Request, book_id: int, db: Session = Depends(get_db)):
     """Trigger image generation for a book that has already been analyzed."""
     book = db.query(models.Book).filter(models.Book.id == book_id).first()
     if not book:

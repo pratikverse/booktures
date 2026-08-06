@@ -36,3 +36,6 @@ openai==2.26.0
 
 # Cloudflare R2 storage (S3-compatible). Only needed if STORAGE_PROVIDER=r2.
 boto3==1.35.99
+
+# Auth + rate limiting
+slowapi==0.1.9

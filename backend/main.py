@@ -6,14 +6,19 @@ and manages the application lifespan (startup/shutdown tasks).
 import os
 import logging
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from database import init_db
 from services.generation_queue_service import start_worker
 from services.settings_service import load_persisted_settings
 from api.routes import router
+from api.limiter import limiter
+from api.auth import require_api_key
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -51,6 +56,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
 # Allow your frontend to talk to the backend.
 # NOTE: allow_credentials=True is invalid together with a wildcard origin per the
 # CORS spec (browsers will reject it), so origins must be listed explicitly.
@@ -69,7 +78,7 @@ if not os.path.exists("storage"):
 app.mount("/storage", StaticFiles(directory="storage"), name="storage")
 
 # Include the routes from our api module
-app.include_router(router)
+app.include_router(router, dependencies=[Depends(require_api_key)])
 
 @app.get("/")
 async def root():
