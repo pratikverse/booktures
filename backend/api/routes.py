@@ -249,8 +249,16 @@ def manage_job(job_id: int, action: str = Body(..., embed=True), db: Session = D
 @router.get("/settings")
 def get_settings():
     """Get current AI configuration."""
+    llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+    llm_model = {
+        "groq": os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+        "gemini": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+    }.get(llm_provider, pdf_service.OLLAMA_DEFAULT_MODEL)
+
     # Return flat structure expected by frontend lib/api.ts
     return {
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
         "ollama_url": pdf_service.OLLAMA_BASE_URL,
         "model_name": pdf_service.OLLAMA_DEFAULT_MODEL,
         "timeout": int(pdf_service.OLLAMA_TIMEOUT_SECONDS),

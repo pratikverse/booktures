@@ -2,6 +2,8 @@ import { apiClient } from "./apiClient";
 import type { Settings } from "./types";
 
 type BackendSettings = {
+  llm_provider: string;
+  llm_model: string;
   ollama_url: string;
   model_name: string;
   timeout: number;
@@ -16,6 +18,8 @@ type BackendSettings = {
 
 function toFrontendSettings(b: BackendSettings): Settings {
   return {
+    llmProvider: b.llm_provider,
+    llmModel: b.llm_model,
     ollamaUrl: b.ollama_url,
     modelName: b.model_name,
     timeout: b.timeout,

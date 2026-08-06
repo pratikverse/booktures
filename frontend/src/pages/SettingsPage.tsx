@@ -30,6 +30,7 @@ export default function SettingsPage() {
   const { data: modelsData } = useQuery({
     queryKey: ["ollama-models"],
     queryFn: getOllamaModels,
+    enabled: initial?.llmProvider === "ollama",
   });
 
   const [s, setS] = useState<Settings | null>(null);
@@ -77,34 +78,52 @@ export default function SettingsPage() {
       />
 
       <Card className="p-6 space-y-4 shadow-card">
-        <h2 className="font-semibold text-lg">Ollama</h2>
+        <h2 className="font-semibold text-lg">Language Model</h2>
         <div className="grid gap-2">
-          <Label>Ollama URL</Label>
-          <Input value={s.ollamaUrl} readOnly className="bg-muted" />
+          <Label>Active provider</Label>
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center rounded-sm border border-border bg-muted px-2 py-1 font-mono text-xs uppercase tracking-wide text-foreground">
+              {s.llmProvider}
+            </span>
+            <span className="text-sm text-muted-foreground">{s.llmModel}</span>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Set via the <code>LLM_PROVIDER</code> environment variable on the backend — not
+            editable here.
+          </p>
         </div>
-        <div className="grid gap-2">
-          <Label>LLM Model</Label>
-          <Select value={s.modelName} onValueChange={(v) => update("modelName", v)}>
-            <SelectTrigger>
-              <SelectValue placeholder="Select model" />
-            </SelectTrigger>
-            <SelectContent>
-              {(modelsData?.models ?? [s.modelName]).filter(Boolean).map((m) => (
-                <SelectItem key={m} value={m}>
-                  {m}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="grid gap-2">
-          <Label>Timeout (sec)</Label>
-          <Input
-            type="number"
-            value={s.timeout}
-            onChange={(e) => update("timeout", Number(e.target.value))}
-          />
-        </div>
+
+        {s.llmProvider === "ollama" && (
+          <>
+            <div className="grid gap-2">
+              <Label>Ollama URL</Label>
+              <Input value={s.ollamaUrl} readOnly className="bg-muted" />
+            </div>
+            <div className="grid gap-2">
+              <Label>LLM Model</Label>
+              <Select value={s.modelName} onValueChange={(v) => update("modelName", v)}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Select model" />
+                </SelectTrigger>
+                <SelectContent>
+                  {(modelsData?.models ?? [s.modelName]).filter(Boolean).map((m) => (
+                    <SelectItem key={m} value={m}>
+                      {m}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="grid gap-2">
+              <Label>Timeout (sec)</Label>
+              <Input
+                type="number"
+                value={s.timeout}
+                onChange={(e) => update("timeout", Number(e.target.value))}
+              />
+            </div>
+          </>
+        )}
       </Card>
 
       <Card className="p-6 space-y-4 shadow-card">

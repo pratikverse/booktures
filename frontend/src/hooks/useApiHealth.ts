@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react";
 import { getHealth, type HealthStatus } from "@/lib/api";
 
-const POLL_INTERVAL_MS = 15_000;
+// Longer than Drape's original 15s: polling this fast against Render's
+// free tier (fronted by Cloudflare) was tripping rate-based protection on
+// the /health path specifically, returning 503s the app was otherwise
+// never seeing on /settings or /books.
+const POLL_INTERVAL_MS = 60_000;
 
 export function useApiHealth() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
