@@ -54,3 +54,18 @@ Local dev is now pointed at a real Supabase project (Postgres + Storage, local
   via the storage REST API.
 - Bucket needs the **Public** toggle on, since `SupabaseStorageProvider` returns
   `.../storage/v1/object/public/<bucket>/<key>` URLs (no signed-URL support yet).
+
+## Cloud LLM/image providers — verified working
+
+Tested against real accounts:
+
+- Groq (`LLM_PROVIDER=groq`) — works.
+- Gemini (`LLM_PROVIDER=gemini`) — works. Default model bumped to
+  `gemini-2.5-flash`; `gemini-1.5-flash` has been retired.
+- Pollinations (`IMAGE_PROVIDER=pollinations`) — works, no key needed,
+  semi-realistic style.
+- Cloudflare Workers AI (`IMAGE_PROVIDER=workers-ai`) — added and works,
+  needs `CF_ACCOUNT_ID` + `CF_API_TOKEN` (Workers AI: Edit permission).
+  Default model `@cf/stabilityai/stable-diffusion-xl-base-1.0` renders a
+  flatter, more cartoon-ish style than Pollinations — pick based on which
+  look fits the book's illustration style.

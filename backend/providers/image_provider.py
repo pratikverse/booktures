@@ -138,9 +138,61 @@ class PollinationsProvider(ImageProvider):
             return None
 
 
+class CloudflareWorkersAIProvider(ImageProvider):
+    """Cloud image generation via Cloudflare Workers AI."""
+
+    def render(self, prompt: str, negative_prompt: str, book_id: int, page_num: int, seed: int) -> Optional[str]:
+        import httpx
+        import base64
+        from io import BytesIO
+        from PIL import Image
+
+        account_id = os.getenv("CF_ACCOUNT_ID")
+        api_token = os.getenv("CF_API_TOKEN")
+        model = os.getenv("CF_WORKERS_AI_MODEL", "@cf/stabilityai/stable-diffusion-xl-base-1.0")
+        if not account_id or not api_token:
+            logger.warning("CF_ACCOUNT_ID/CF_API_TOKEN not set; skipping image generation.")
+            return None
+
+        config = _resolve_generation_config()
+        try:
+            response = httpx.post(
+                f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}",
+                headers={"Authorization": f"Bearer {api_token}"},
+                json={
+                    "prompt": prompt,
+                    "negative_prompt": negative_prompt,
+                    "width": config["width"],
+                    "height": config["height"],
+                    "seed": seed,
+                    "num_steps": min(config["steps"], 20),
+                },
+                timeout=float(os.getenv("CF_TIMEOUT_SECONDS", "60.0")),
+            )
+            response.raise_for_status()
+
+            content_type = response.headers.get("content-type", "")
+            if content_type.startswith("image/"):
+                image_bytes = response.content
+            else:
+                data = response.json()
+                b64 = (data.get("result") or {}).get("image")
+                if not b64:
+                    logger.error(f"Unexpected Workers AI response: {data}")
+                    return None
+                image_bytes = base64.b64decode(b64)
+
+            image = Image.open(BytesIO(image_bytes)).convert("RGB")
+            return _save(image, book_id, page_num)
+        except Exception as e:
+            logger.error(f"Cloudflare Workers AI image generation failed: {e}")
+            return None
+
+
 _providers = {
     "diffusers": DiffusersProvider,
     "pollinations": PollinationsProvider,
+    "workers-ai": CloudflareWorkersAIProvider,
 }
 
 _instance_cache = {}
