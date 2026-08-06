@@ -121,6 +121,10 @@ def ollama_generate(prompt: str, model: str = None, system: str = "") -> str:
     """
     if not OLLAMA_ENABLED:
         return ""
+    # Model tags like "phi3"/"qwen2.5:7b" are Ollama-specific; other providers
+    # should fall back to their own configured default instead of 404ing.
+    if os.getenv("LLM_PROVIDER", "ollama").strip().lower() != "ollama":
+        model = None
     return get_llm_provider().generate(prompt, system=system, model=model)
 
 
