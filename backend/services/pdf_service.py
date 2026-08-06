@@ -16,15 +16,10 @@ from functools import lru_cache
 import logging
 import re
 from typing import Any
-from pathlib import Path
 from providers.llm_provider import get_llm_provider
 
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Configuration for storage and logging
-# ---------------------------------------------------------------------------
-PDF_STORAGE_PATH = Path(__file__).resolve().parents[1] / "storage" / "pdfs"
 logger = logging.getLogger(__name__)
 
 # Allow overriding the Tesseract binary path via environment variable
@@ -147,21 +142,27 @@ def _safe_parse_json(raw: str, fallback: dict) -> dict:
 
 def save_pdf(file_bytes: bytes, filename: str) -> str:
     """
-    Saves a PDF file to the local storage with a unique filename.
+    Saves a PDF via the configured storage provider (local disk by default,
+    Supabase/R2 in deployments with an ephemeral filesystem - same
+    abstraction illustrations already use, so uploaded PDFs survive a
+    backend restart instead of 404ing once local disk gets wiped).
 
     Args:
         file_bytes: The raw binary data of the PDF.
         filename:   The original name of the file.
 
     Returns:
-        The absolute string path to the saved file.
+        A relative path (local storage) or absolute URL (Supabase/R2)
+        identifying the saved file.
     """
-    PDF_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
+    from providers.storage_provider import get_storage_provider
+
     unique_name = f"{uuid.uuid4()}_{filename}"
-    file_path = PDF_STORAGE_PATH / unique_name
-    # Atomic write of the binary data to the local filesystem
-    file_path.write_bytes(file_bytes)
-    return str(file_path)
+    key = f"pdfs/{unique_name}"
+    saved = get_storage_provider().save(file_bytes, key, content_type="application/pdf")
+    if not saved:
+        raise RuntimeError("Failed to save PDF via the configured storage provider.")
+    return saved
 
 
 # ===========================================================================
@@ -189,10 +190,24 @@ def extract_text_by_page(pdf_path: str) -> list[dict]:
     footer_counts: Counter = Counter()
     pypdf_pages: list[Any] = []
 
+    # book.file_path is a remote URL when STORAGE_PROVIDER isn't local (e.g.
+    # Supabase) - pdfplumber/pypdf need actual bytes, so fetch once and hand
+    # both readers a fresh BytesIO (streams can't be read twice).
+    if pdf_path.startswith("http://") or pdf_path.startswith("https://"):
+        from io import BytesIO
+        response = httpx.get(pdf_path, timeout=60.0)
+        response.raise_for_status()
+        pdf_source_bytes = response.content
+        pypdf_source: Any = BytesIO(pdf_source_bytes)
+        plumber_source: Any = BytesIO(pdf_source_bytes)
+    else:
+        pypdf_source = pdf_path
+        plumber_source = pdf_path
+
     # Attempt to load with pypdf to provide an alternative extraction source
     try:
         from pypdf import PdfReader  # type: ignore
-        reader = PdfReader(pdf_path)
+        reader = PdfReader(pypdf_source)
         pypdf_pages = list(reader.pages)
     except Exception as exc:
         logger.debug("pypdf unavailable for %s: %s", pdf_path, exc)
@@ -200,7 +215,7 @@ def extract_text_by_page(pdf_path: str) -> list[dict]:
     # ------------------------------------------------------------------
     # Phase 1: Initial extraction and header/footer candidate collection
     # ------------------------------------------------------------------
-    with pdfplumber.open(pdf_path) as pdf:
+    with pdfplumber.open(plumber_source) as pdf:
         for i, page in enumerate(pdf.pages):
             pypdf_page = pypdf_pages[i] if i < len(pypdf_pages) else None
             raw_text, extraction_meta = _extract_page_text(page, pypdf_page=pypdf_page)

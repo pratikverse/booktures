@@ -113,14 +113,11 @@ def get_book_details(book_id: int, db: Session = Depends(get_db)):
     db_book = db.query(models.Book).filter(models.Book.id == book_id).first()
     if not db_book:
         raise HTTPException(status_code=404, detail="Book not found")
-    
-    # Extract the filename from the absolute path stored in DB
-    filename = os.path.basename(db_book.file_path)
 
     return {
-        "id": db_book.id, 
-        "title": db_book.title, 
-        "file_path": f"storage/pdfs/{filename}", # Relative path for web access
+        "id": db_book.id,
+        "title": db_book.title,
+        "file_path": db_book.file_path,
         "status": db_book.status
     }
 
