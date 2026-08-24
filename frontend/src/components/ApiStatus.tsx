@@ -21,7 +21,7 @@ export default function ApiStatus() {
   return (
     <span
       title={error?.message}
-      className="hidden shrink-0 items-center gap-1.5 rounded-sm border border-border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-widest text-muted-foreground sm:inline-flex"
+      className="hidden shrink-0 items-center gap-1.5 rounded-full border border-border px-2 py-0.5 font-mono text-[10px] uppercase tracking-widest text-muted-foreground sm:inline-flex"
     >
       <span className={`size-1.5 rounded-full ${dot}`} aria-hidden="true" />
       {label}

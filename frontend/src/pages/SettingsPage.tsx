@@ -71,7 +71,7 @@ export default function SettingsPage() {
   const supportsModelAndGuidance = s.imageProvider === "diffusers";
 
   return (
-    <div className="mx-auto max-w-3xl space-y-6 p-6 md:p-8">
+    <div className="mx-auto max-w-3xl space-y-6 px-6 py-14 sm:py-16">
       <PageHeader
         kicker="Configuration"
         title="Settings"
@@ -83,7 +83,7 @@ export default function SettingsPage() {
         <div className="grid gap-2">
           <Label>Active provider</Label>
           <div className="flex items-center gap-2">
-            <span className="inline-flex items-center rounded-sm border border-border bg-muted px-2 py-1 font-mono text-xs uppercase tracking-wide text-foreground">
+            <span className="inline-flex items-center rounded-full border border-border bg-muted px-2.5 py-1 font-mono text-xs uppercase tracking-wide text-foreground">
               {s.llmProvider}
             </span>
             <span className="text-sm text-muted-foreground">{s.llmModel}</span>

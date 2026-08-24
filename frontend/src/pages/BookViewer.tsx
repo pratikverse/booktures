@@ -120,7 +120,7 @@ export default function BookViewer() {
                 {pageCharacters.length > 0 && (
                   <div className="mt-3 space-y-2">
                     {pageCharacters.map((c) => (
-                      <div key={c.id} className="rounded-md border p-2">
+                      <div key={c.id} className="rounded-xl border border-border p-2">
                         <div className="text-sm font-medium">{c.name}</div>
                         <div className="text-xs text-muted-foreground">{c.visual_profile}</div>
                       </div>

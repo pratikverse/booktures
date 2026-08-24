@@ -67,7 +67,7 @@ export default function BookCard({ book }: { book: Book }) {
   });
 
   return (
-    <Card className="p-5 shadow-card hover:shadow-elegant transition-shadow flex flex-col gap-4">
+    <Card className="p-5 shadow-card transition-all duration-300 hover:-translate-y-1 hover:border-primary/40 hover:shadow-elegant flex flex-col gap-4">
       <div className="flex items-start gap-3">
         <div className="size-12 rounded-lg bg-gradient-primary grid place-items-center shrink-0">
           <BookOpen className="size-6 text-primary-foreground" />

@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import BookCard from "@/components/BookCard";
 import PipelineStrip from "@/components/PipelineStrip";
+import { Reveal } from "@/lib/reveal";
 
 export default function Library() {
   const qc = useQueryClient();
@@ -56,52 +57,65 @@ export default function Library() {
 
   return (
     <div className="relative overflow-hidden">
-      <div className="grid-backdrop pointer-events-none absolute inset-0" aria-hidden="true" />
       <div
-        className="pointer-events-none absolute -top-40 left-1/2 size-[36rem] -translate-x-1/2 rounded-full bg-primary/20 blur-[140px]"
         aria-hidden="true"
+        className="pointer-events-none absolute inset-0 -z-10"
+        style={{
+          background:
+            "radial-gradient(60rem 40rem at 50% -10%, color-mix(in oklab, hsl(var(--primary)) 12%, transparent), transparent 60%)",
+        }}
       />
 
-      <section className="relative mx-auto max-w-7xl px-5 py-16 sm:py-20">
-        <p className="font-mono text-[11px] uppercase tracking-[0.25em] text-primary">
-          AI illustrated reading · local + cloud pipeline
-        </p>
-        <h1 className="mt-5 max-w-3xl font-display text-4xl font-bold leading-[1.05] sm:text-5xl">
-          Books can&apos;t picture themselves.
-        </h1>
-        <p className="mt-5 max-w-2xl text-base leading-relaxed text-muted-foreground sm:text-lg">
-          Upload a PDF and Booktures reads it page by page — pulling out the narrative, tracking
-          characters across chapters, and generating consistent illustrations for the scenes as
-          they happen.
-        </p>
+      <section className="relative mx-auto max-w-5xl px-6 pt-20 pb-16 sm:pt-24 sm:pb-20">
+        <Reveal delay={0}>
+          <p className="inline-flex items-center gap-2 rounded-full border border-border bg-card/60 px-3 py-1 text-xs font-medium text-muted-foreground backdrop-blur">
+            <span className="relative flex h-1.5 w-1.5">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-60" />
+              <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-primary" />
+            </span>
+            AI illustrated reading · local + cloud pipeline
+          </p>
+        </Reveal>
 
-        <div className="mt-8 flex items-center gap-3">
-          <input
-            ref={fileRef}
-            type="file"
-            accept="application/pdf,image/*"
-            className="hidden"
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) handleUpload(f);
-            }}
-          />
-          <Button
-            onClick={() => fileRef.current?.click()}
-            disabled={uploading}
-            className="gap-2 rounded-sm bg-primary px-5 py-3 text-sm font-medium text-primary-foreground hover:opacity-90"
-          >
-            <Upload className="size-4" />
-            {uploading ? `Uploading ${uploadProgress}%` : "Upload a PDF"}
-          </Button>
-        </div>
+        <Reveal delay={80}>
+          <h1 className="mt-6 max-w-3xl text-4xl font-bold leading-[1.05] tracking-tight text-foreground sm:text-5xl">
+            Books can&apos;t picture themselves.
+          </h1>
+        </Reveal>
+
+        <Reveal delay={160}>
+          <p className="mt-6 max-w-2xl text-lg leading-relaxed text-muted-foreground">
+            Upload a PDF and Booktures reads it page by page — pulling out the narrative, tracking
+            characters across chapters, and generating consistent illustrations for the scenes as
+            they happen.
+          </p>
+        </Reveal>
+
+        <Reveal delay={240}>
+          <div className="mt-9 flex items-center gap-3">
+            <input
+              ref={fileRef}
+              type="file"
+              accept="application/pdf,image/*"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleUpload(f);
+              }}
+            />
+            <Button onClick={() => fileRef.current?.click()} disabled={uploading} className="gap-2">
+              <Upload className="size-4" />
+              {uploading ? `Uploading ${uploadProgress}%` : "Upload a PDF"}
+            </Button>
+          </div>
+        </Reveal>
 
         <div className="mt-16">
           <PipelineStrip />
         </div>
       </section>
 
-      <section className="relative mx-auto max-w-7xl px-5 pb-16">
+      <section className="relative mx-auto max-w-7xl px-6 pb-16">
         <div className="mb-6 flex flex-wrap items-center justify-between gap-4 border-t border-border pt-8">
           <div className="relative w-full max-w-sm">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
@@ -122,8 +136,8 @@ export default function Library() {
             <Loader2 className="size-6 animate-spin" />
           </div>
         ) : filtered.length === 0 ? (
-          <div className="rounded-md border border-dashed border-border p-16 text-center">
-            <h3 className="font-display text-lg font-semibold">No books yet</h3>
+          <div className="rounded-2xl border border-dashed border-border p-16 text-center">
+            <h3 className="text-lg font-semibold text-foreground">No books yet</h3>
             <p className="mt-1 text-muted-foreground">Upload a PDF above to get started.</p>
           </div>
         ) : (
