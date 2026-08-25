@@ -133,6 +133,9 @@ Copy `backend/.env.example` to `backend/.env` and set your own `DATABASE_URL` / 
 From the repository root:
 
 ```bash
+conda create -n booktures python=3.11
+conda activate booktures
+
 pip install -r requirements.txt   # full local dev (API + GPU inference stack)
 # or for a lean cloud/API-only install:
 # pip install -r backend/requirements-api.txt
